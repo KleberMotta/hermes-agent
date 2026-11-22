@@ -460,6 +460,18 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
 
     async def _send_home_channel_message(self, platform, home, transport, message: str, failure_fmt: str) -> bool:
         """Best-effort send to one home channel; True on success, failures logged with ``failure_fmt``."""
+        sent, _keep = await self._send_home_channel_outcome(platform, home, transport, message, failure_fmt)
+        return sent
+
+    async def _send_home_channel_outcome(
+        self, platform, home, transport, message: str, failure_fmt: str,
+    ) -> tuple[bool, bool]:
+        """``_send_home_channel_message`` with the verdict on a failure: ``(sent, keep)``.
+
+        ``keep`` is True when the target should stay owed: a refusal only a reconnect retries (the same
+        decider as the delivery ledger and the restart notice), or a send that raised. A permanent refusal
+        (a deleted channel) is ``(False, False)``: retrying it at every restart can never succeed."""
+        from gateway.delivery_ledger import is_reconnect_only
         from gateway.run import _non_conversational_metadata
         try:
             metadata = self._thread_metadata_for_target(platform, home.chat_id, home.thread_id, adapter=transport.adapter)
@@ -475,12 +487,13 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             else:
                 result = await transport.adapter.send(str(home.chat_id), message)
             if _send_failed(result):
-                logger.warning(failure_fmt, platform.value, home.chat_id, _send_error(result))
-                return False
-            return True
-        except Exception as exc:
+                error = _send_error(result)
+                logger.warning(failure_fmt, platform.value, home.chat_id, error)
+                return False, is_reconnect_only(error)
+            return True, False
+        except Exception as exc:  # health: allow BLE001 -- best-effort notice boundary, unchanged from _send_home_channel_message: logs the failure and keeps the target owed
             logger.warning(failure_fmt, platform.value, home.chat_id, exc)
-            return False
+            return False, True
 
     _planned_restart_notice_lock: Optional[asyncio.Lock] = None
 
@@ -507,6 +520,9 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             try:
                 data = json.loads(path.read_text(encoding="utf-8-sig"))
                 delivered = {tuple(target) for target in data.get("delivered_targets", [])}
+                # Permanently refused (a deleted channel): owed no more, but NOT delivered, so a profile
+                # sharing that chat still gets its own notice.
+                abandoned = {tuple(target) for target in data.get("abandoned_targets", [])}
                 # Owed targets come from config, not live transports: a removed home or an opt-out
                 # (gateway_restart_notification=false) must not keep the marker alive forever.
                 owed = {
@@ -515,17 +531,20 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     for profile, platform, cfg in self._served_home_channel_configs()
                     if cfg.home_channel and cfg.home_channel.chat_id and cfg.gateway_restart_notification
                 }
-                delivered |= await self._send_home_channel_startup_notifications(skip_targets=delivered)
-                if owed <= delivered:
+                delivered |= await self._send_home_channel_startup_notifications(
+                    skip_targets=delivered, abandoned_targets=abandoned)
+                if owed <= delivered | abandoned:
                     path.unlink(missing_ok=True)
                     return
                 data["delivered_targets"] = [list(target) for target in delivered]
+                data["abandoned_targets"] = [list(target) for target in abandoned]
                 atomic_json_write(path, data, indent=None)
             except Exception:
                 logger.warning("Planned-restart notification remains pending", exc_info=True)
 
     async def _send_home_channel_startup_notifications(
-        self, *, skip_targets: Optional[set[tuple[str, str, Optional[str]]]] = None
+        self, *, skip_targets: Optional[set[tuple[str, str, Optional[str]]]] = None,
+        abandoned_targets: Optional[set[tuple[str, str, Optional[str]]]] = None,
     ) -> set[tuple[str, str, Optional[str]]]:
         """Notify EVERY served profile's configured home channels that the gateway is back online.
 
@@ -533,10 +552,13 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         Telegram group for the whole host), and one host process restarting once owes that chat
         one notice. Accounting stays per profile so the marker's owed set still discharges.
         ``skip_targets`` lets startup avoid duplicate messages when a more specific restart
-        notification is queued for the same chat.
+        notification is queued for the same chat. ``abandoned_targets`` is read and extended in place: a
+        target the platform refused for good is added to it and never retried, yet is not "delivered"
+        (it does not mark its chat notified for the other profiles sharing it).
         """
         delivered: set[tuple[str, str, Optional[str]]] = set()
         skipped = skip_targets or set()
+        abandoned = abandoned_targets if abandoned_targets is not None else set()
         message = t("gateway.startup.online")
         targets = list(self._served_home_channel_transports())
         # A chat already notified for ANOTHER profile is not notified again.
@@ -553,18 +575,21 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 )
                 continue
             target = _served_notice_target_key(profile, platform.value, home.chat_id, home.thread_id)
-            if target in skipped or target in delivered:
+            if target in skipped or target in delivered or target in abandoned:
                 continue
             chat = _delivery_target_key(platform.value, home.chat_id, home.thread_id, profile=profile)
             if chat in notified_chats:
                 delivered.add(target)
                 continue
-            if await self._send_home_channel_message(
+            sent, keep = await self._send_home_channel_outcome(
                 platform, home, transport, message, "Home-channel startup notification failed for %s:%s: %s",
-            ):
+            )
+            if sent:
                 notified_chats.add(chat)
                 delivered.add(target)
                 logger.info("Sent home-channel startup notification to %s:%s", platform.value, home.chat_id)
+            elif not keep:
+                abandoned.add(target)
         return delivered
 
     async def _send_session_db_warning_notifications(self) -> None:

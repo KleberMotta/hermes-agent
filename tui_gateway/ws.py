@@ -137,6 +137,39 @@ except ImportError:  # pragma: no cover - starlette is a required install path
     _WebSocketDisconnect = Exception  # type: ignore[assignment]
 
 
+def _is_ws_disconnect(exc: BaseException) -> bool:
+    """The socket is already gone: a peer hang-up, or I/O on a socket closed under us.
+
+    Starlette reports the latter as a bare ``RuntimeError`` (``... Need to call "accept" first.`` /
+    ``Cannot call "send" once a close message has been sent.``), expected after our own close."""
+    if isinstance(exc, _WebSocketDisconnect):
+        return True
+    return isinstance(exc, RuntimeError) and ('"accept"' in str(exc) or "close message has been sent" in str(exc))
+
+
+def _receive_disconnect_reason(transport: WSTransport, exc: BaseException) -> str | None:
+    """Why a failed ``receive_text`` ended the connection, or None when it is a real failure.
+
+    The server's own close (send deadline, fanout overflow) outranks the symptom it produced."""
+    if not _is_ws_disconnect(exc):
+        return None
+    if transport.close_reason is not None:
+        return transport.close_reason
+    if transport.peer_disconnected or not transport.closed:
+        return f"client_disconnect(code={getattr(exc, 'code', None)},reason={getattr(exc, 'reason', None)})"
+    return "transport_closed"
+
+
+def _log_ready_failure(transport: WSTransport, peer: str) -> str:
+    """Log a failed ``gateway.ready`` send and return the disconnect reason: a client that left first is
+    routine (DEBUG); anything else (a stalled socket, a send error) is an ERROR."""
+    if transport.peer_disconnected:
+        _log.debug("ws client left before the ready frame peer=%s", peer)
+        return "client_disconnect_before_ready"
+    _log.error("ws ready frame send failed peer=%s", peer)
+    return "ready_send_failed"
+
+
 class WSTransport:
     """Per-connection WS transport. ``write`` is safe from any thread *other than* the loop thread owning the
     socket (pool workers marshal onto the loop and block on the future); from the loop thread itself it would
@@ -167,6 +200,32 @@ class WSTransport:
         # One socket close per transport: the send-deadline path and abort() both reach for a 1011,
         # and under load both fire — latched on the loop thread so the peer gets a single close frame.
         self._close_scheduled = False
+        #: Why the SERVER closed the socket ("send_deadline" / "fanout_overflow"); first writer wins, so the
+        #: receive that fails on the dead socket reports the cause, not the symptom.
+        self._close_reason: str | None = None
+        #: A send failed because the peer was already gone (not a server-side failure).
+        self._peer_disconnected = False
+
+    def _record_close(self, reason: str) -> None:
+        with self._token_lock:
+            if self._close_reason is None:
+                self._close_reason = reason
+
+    def _note_send_failure(self, exc: BaseException, what: str) -> None:
+        """Log a failed send: a peer that is already gone is routine (DEBUG), anything else is a warning."""
+        if _is_ws_disconnect(exc):
+            self._peer_disconnected = True
+            _log.debug("%s peer=%s peer disconnected error_type=%s", what, self._peer, type(exc).__name__)
+            return
+        _log.warning("%s peer=%s error_type=%s error=%s", what, self._peer, type(exc).__name__, exc)
+
+    @property
+    def close_reason(self) -> str | None:
+        return self._close_reason
+
+    @property
+    def peer_disconnected(self) -> bool:
+        return self._peer_disconnected
 
     def _on_loop(self) -> bool:
         try:
@@ -214,7 +273,7 @@ class WSTransport:
             return not self._closed
         except Exception as exc:
             self._closed = True
-            _log.warning("ws write failed peer=%s error_type=%s error=%s", self._peer, type(exc).__name__, exc)
+            self._note_send_failure(exc, "ws write failed")
             return False
 
     def _arm_token_flush(self) -> None:  # loop thread
@@ -286,6 +345,7 @@ class WSTransport:
                     # batches bail, and close the socket so handle_ws's read loop ends and its teardown
                     # (session detach/reap, client reconnect) runs. See #106369.
                     self._closed = True
+                    self._record_close("send_deadline")
                     _log.warning("ws send deadline exceeded (socket stalled, loop responsive) peer=%s deadline=%ss — closing",
                                  self._peer, _WS_SEND_DEADLINE_S)
                     self._loop.create_task(self._close_socket(1011, "send deadline"))
@@ -297,7 +357,7 @@ class WSTransport:
                 except Exception as exc:
                     # Latch while holding the writer lock so queued batches observe the failure first.
                     self._closed = True
-                    _log.warning("ws send failed peer=%s error_type=%s error=%s", self._peer, type(exc).__name__, exc)
+                    self._note_send_failure(exc, "ws send failed")
                     return
 
     def close(self) -> None:  # loop thread (handle_ws finally), so the TimerHandle is safe
@@ -310,6 +370,7 @@ class WSTransport:
         """Close from any thread and drop the socket with 1011 so the client reconnects and replays
         (fanout overflow). One-shot: N mirrored sessions overflowing on this socket schedule one close."""
         self._closed = True
+        self._record_close("fanout_overflow")
         with self._token_lock:
             if self._abort_requested:
                 return
@@ -676,9 +737,8 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
         # desktop app and web dashboard reach the agent via this sidecar, not entry.main()).
         _start_backend_liveness()
         if not ready_ok:
-            disconnect_reason = "ready_send_failed"
-            send_failures += 1
-            _log.error("ws ready frame send failed peer=%s", peer)
+            disconnect_reason = _log_ready_failure(transport, peer)
+            send_failures += disconnect_reason == "ready_send_failed"
             return
 
         dispatcher = asyncio.create_task(_dispatch_loop())
@@ -688,12 +748,13 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
                 _note_dashboard_client_activity()
             except _SendFailed:
                 raise
-            except _WebSocketDisconnect as exc:
-                disconnect_reason = f"client_disconnect(code={getattr(exc, 'code', None)},reason={getattr(exc, 'reason', None)})"
-                break
-            except Exception:
-                disconnect_reason = "receive_failed"
-                _log.exception("ws receive failed peer=%s", peer)
+            except Exception as exc:  # health: allow BLE001 -- real failures still _log.exception; only a classified disconnect is routine (DEBUG, traceback kept)
+                disconnect_reason = _receive_disconnect_reason(transport, exc)
+                if disconnect_reason is None:
+                    disconnect_reason = "receive_failed"
+                    _log.exception("ws receive failed peer=%s", peer)
+                else:
+                    _log.debug("ws receive ended peer=%s reason=%s", peer, disconnect_reason, exc_info=True)
                 break
             line = raw.strip()
             if not line:
