@@ -4,7 +4,9 @@ load/save paths (state.db gateway_routing primary, sessions.json legacy mirror).
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import contextvars
 import functools
 import logging
 import json
@@ -36,6 +38,52 @@ _SESSIONS_JSON_README = (
 def authority_persistence(authority):
     """*authority*'s storage interface handle, the one it was built with."""
     return authority.persistence
+
+
+# Per-authority cap on blocking storage calls in flight off the loop. The loop's default executor is
+# shared by every served profile: without a cap, writers stuck behind one profile's holder lock could
+# occupy every thread and starve the other profiles' calls. Waiters queue on the semaphore, not a thread.
+_OFF_LOOP_SLOTS = 3
+_LOOP_LAG_WARN_S = 0.25
+
+
+def _off_loop_gate(authority):
+    """The authority's semaphore for the running loop (created lazily: a semaphore binds to its loop)."""
+    loop = asyncio.get_running_loop()
+    entry = getattr(authority, '_off_loop_gate', None)
+    if entry is None or entry[0] is not loop:
+        entry = (loop, asyncio.Semaphore(_OFF_LOOP_SLOTS))
+        try:
+            authority._off_loop_gate = entry
+        except AttributeError:  # an authority stand-in that takes no attributes: uncapped
+            return None
+    return entry[1]
+
+
+async def run_off_loop(authority, fn, /, *args, **kwargs):
+    """Run the blocking storage/OS call ``fn`` on a worker thread and await it; the loop stays free.
+
+    The caller's contextvars (profile scope, secrets, terminal policy) are COPIED into the thread and
+    ``fn`` runs there as one ``Context.run``, so nothing a thread binds leaks back and no other profile's
+    scope is ever seen. ``fn`` runs entirely off the loop and must never wait for it (no
+    ``run_coroutine_threadsafe(...).result()``, no ``asyncio.run``): schedule loop work after this returns.
+    At most ``_OFF_LOOP_SLOTS`` such calls per authority are in flight; the rest wait on the semaphore."""
+    loop = asyncio.get_running_loop()
+    gate = _off_loop_gate(authority)
+    call = functools.partial(contextvars.copy_context().run, fn, *args, **kwargs)
+    started = loop.time()
+    if gate is None:
+        result = await loop.run_in_executor(None, call)
+    else:
+        async with gate:
+            result = await loop.run_in_executor(None, call)
+    before = loop.time()
+    await asyncio.sleep(0)  # latency probe: one trip round the loop, so a stalled loop shows in the log
+    lag = loop.time() - before
+    if lag > _LOOP_LAG_WARN_S:
+        logger.warning('Event loop took %.2fs to turn after off-loop %s (call took %.2fs)',
+                       lag, getattr(fn, '__name__', fn), before - started)
+    return result
 
 
 def owner_rule():

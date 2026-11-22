@@ -21,7 +21,7 @@ from gateway.session_contract import (
 )
 from gateway.session_events import SessionEvents
 from gateway.session_pending_controls import PendingControls
-from gateway.session_persistence import authority_persistence
+from gateway.session_persistence import authority_persistence, run_off_loop
 from gateway.session_producer_lifecycle import drop_producer_turn, mark_producer_admission
 from hermes_cli.observability.shared_metrics_busy import busy_row_settled
 from persistence.authority.admissions import GateRefusal
@@ -511,10 +511,11 @@ class SessionAuthority:
             from gateway.session_runtime_workers import persist_work_count
             live.task.add_done_callback(lambda task: persist_work_count(self, task))
 
-    def wake_after_worker(self, session_id):
+    def wake_after_worker(self, session_id, owner=None):
         """A worker execution on ``session_id`` (a logical owner or its compression continuation)
-        ended: a drain that parked behind it re-runs. A no-op while a drain is running."""
-        for sid in dict.fromkeys((session_id, self.logical_owner(session_id))):
+        ended: a drain that parked behind it re-runs. A no-op while a drain is running. ``owner``: its
+        ``logical_owner``, when the caller already read it off the loop (that read is a SQLite call)."""
+        for sid in dict.fromkeys((session_id, self.logical_owner(session_id) if owner is None else owner)):
             if sid in self.sessions:
                 self._schedule(SessionRef(self.profile_id, sid))
 
@@ -816,7 +817,10 @@ class SessionAuthority:
 
     async def receipt(self, actor, ref, admission_id):
         self.authorize(actor, ref, 'session:submit')
-        row = admission_row(authority_persistence(self).admissions.get(admission_id=admission_id))
+        # Clients poll this every 0.2 s: the read waits on the profile's writer lock when the read pool is
+        # exhausted, so it runs off the loop.
+        row = await run_off_loop(self, lambda: admission_row(
+            authority_persistence(self).admissions.get(admission_id=admission_id)))
         if row is None or row['target_session_id'] != ref.session_id:
             raise AuthorityRefusal('not_found')
         from gateway.owner_identity import same_owner

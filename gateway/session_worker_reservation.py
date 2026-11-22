@@ -9,6 +9,7 @@ import subprocess
 from dataclasses import asdict
 
 from gateway.session_persistence import authority_persistence, owner_rule
+from gateway.session_worker import _is_zombie
 from persistence.core.errors import AuthorityRefusal
 
 # A venv launcher (uv's Windows python.exe, pip's exe shim) sits between the owner's
@@ -35,12 +36,12 @@ def verify_worker_identity(process, hello):
         raise AuthorityRefusal('permission_denied')
     try:
         handle = psutil.Process(process.pid)
-        if handle.ppid() != os.getpid() or handle.status() == psutil.STATUS_ZOMBIE:
+        if handle.ppid() != os.getpid() or _is_zombie(handle):
             raise AuthorityRefusal('permission_denied')
         worker = psutil.Process(pid)
         from hermes_cli.process_identity import worker_birth
         birth = worker_birth(worker)  # kernel start: stable across clock steps (#140580) and btime re-anchors
-        if birth != hello['birth'] or not worker.is_running() or worker.status() == psutil.STATUS_ZOMBIE:
+        if birth != hello['birth'] or not worker.is_running() or _is_zombie(worker):
             raise AuthorityRefusal('permission_denied')
         # psutil's parent() already refuses a recycled ppid (parent born after child).
         chain = [p.pid for p in worker.parents()[:MAX_LAUNCHER_HOPS]]

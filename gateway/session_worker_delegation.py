@@ -66,20 +66,19 @@ def persist_worker_delegation(store, *, epoch, execution_id, session_id, generat
 
 async def worker_delegation_request(connection, ref, params):
     """worker.persist delegation-family hook; all authentication stays mandatory."""
-    import asyncio
+    from gateway.session_persistence import authority_persistence, run_off_loop
     from gateway.session_worker import _SCOPE, _claim, _verify
     if set(params) != _SCOPE | {'epoch', 'sequence', 'operation', 'payload'}:
         raise AuthorityRefusal('invalid_params')
-    claim = _claim(connection, ref, params)
     authority = connection.authority
-    if 'worker:adopt' not in connection.actor.capabilities:
-        raise AuthorityRefusal('permission_denied')
-    _verify(connection, ref, params, claim)
-
-    from gateway.session_persistence import authority_persistence
     store = authority_persistence(authority)
 
     def persist_and_publish():
+        # Claim and verification run here, off the loop, in the same call as the write (see worker_request).
+        claim = _claim(connection, ref, params)
+        if 'worker:adopt' not in connection.actor.capabilities:
+            raise AuthorityRefusal('permission_denied')
+        _verify(connection, ref, params, claim)
         result = persist_worker_delegation(store,
             **{key: params[key] for key in ('epoch', 'execution_id', 'session_id', 'generation',
                                            'sequence', 'operation', 'payload')},
@@ -94,4 +93,4 @@ async def worker_delegation_request(connection, ref, params):
                 # token-guarded claims arbitrate delivery; never ACK at publication.
                 process_registry.completion_queue.put(dict(event) | {'restored': True})
         return result
-    return await asyncio.to_thread(persist_and_publish)
+    return await run_off_loop(authority, persist_and_publish)

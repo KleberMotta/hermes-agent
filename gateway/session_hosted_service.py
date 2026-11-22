@@ -310,6 +310,9 @@ async def ensure_hosted_service(runner):
 
 
 async def _ensure_hosted_service(runner, authority):
+    service = getattr(authority, 'hosted_room_service', None)
+    if service is not None and getattr(service, '_transport_installed', False):
+        return  # the watcher ticks every second: entering owner_scope re-reads the profile's .env each time
     with owner_scope(authority):
         service = getattr(authority, 'hosted_room_service', None)
         if service is None:

@@ -11,7 +11,7 @@ import uuid
 from gateway.config import Platform
 from gateway.session_contract import CANONICAL_GATEWAY_PROTOCOL, SessionActor, SessionRef, Submission
 from gateway.session_llm_oneshot import DeferredReply
-from gateway.session_persistence import authority_persistence
+from gateway.session_persistence import authority_persistence, run_off_loop
 from hermes_constants import profile_name_for_home
 from persistence.core.errors import STORE_FAILURES, AuthorityRefusal, PersistenceError
 
@@ -934,7 +934,8 @@ class AuthorityConnection:
             # a finite viewer reads its ledger (tokens, cost, model, exit reason) from here, the same
             # dict the in-process one-shot wrote from `run_conversation`.
             from gateway.session_results import admission_result
-            saved = admission_result(authority_persistence(self.authority), receipt.admission_id)
+            saved = await run_off_loop(self.authority, admission_result,
+                                       authority_persistence(self.authority), receipt.admission_id)
             if saved is not None:
                 out['result'] = saved['result']
                 out['usage'] = saved.get('usage') or {}
