@@ -258,6 +258,15 @@ except ImportError:
 from pathlib import Path as _Path
 
 
+_DISCORD_UNKNOWN_CHANNEL = 10003
+
+
+def _is_unknown_channel_error(exc: BaseException) -> bool:
+    """``NotFound`` with Discord code 10003 (the channel or thread was deleted). False without discord.py."""
+    not_found = getattr(discord, "NotFound", None) if DISCORD_AVAILABLE and discord is not None else None
+    return isinstance(not_found, type) and isinstance(exc, not_found) and getattr(exc, "code", None) == _DISCORD_UNKNOWN_CHANNEL
+
+
 def _is_discord_transport_error(exc: BaseException) -> bool:
     """True for connection-shaped send failures (dead/dropping WS) that never reached Discord, so
     the delivery ledger can replay them; timeouts excluded (a timed-out send may have landed).
@@ -1213,6 +1222,9 @@ class DiscordAdapter(DiscordLiveGatesMixin, DiscordCommandSyncMixin, DiscordAuth
         # Last successful application_info() for self._client; cleared whenever the client is replaced.
         self._app_info: Any = None
         self._ready_event = asyncio.Event()
+        # Send targets already warned about as deleted (10003); a later success clears the entry. Not a
+        # negative cache: every send still tries the channel.
+        self._unknown_channel_warned: set[str] = set()
         self._allowed_user_ids: set = set()  # For button approval authorization
         self._username_resolved_ids: set = set()  # IDs resolved from username entries (gateway authz union)
         self._username_to_id: dict[str, str] = {}  # lowercased username -> ID, kept across gate refreshes
@@ -3069,6 +3081,7 @@ class DiscordAdapter(DiscordLiveGatesMixin, DiscordCommandSyncMixin, DiscordAuth
                     await self._nonconversational_messages.mark_many(message_ids)
                 elif not _looks_like_nonconversational_history_message(content):
                     self._last_self_message_id[_target_id] = message_ids[-1]
+            self._unknown_channel_warned.discard(str(thread_id or chat_id))
             # Connection-shaped failure (WS drop / closed session): use the ledger's runtime-retryable
             # marker so the reconnect sweep can replay this final response instead of stranding it until a
             # process restart (#95382 silent partial loss).
@@ -3079,6 +3092,11 @@ class DiscordAdapter(DiscordLiveGatesMixin, DiscordCommandSyncMixin, DiscordAuth
             )
             return await self._record_response_async(reply_to, result, content, final_delivery, metadata)
         except Exception as e:  # pragma: no cover - defensive logging
+            if _is_unknown_channel_error(e):
+                # The channel was deleted: permanent, so not retryable, and not an ERROR with a traceback.
+                self._log_unknown_channel(str((metadata or {}).get("thread_id") or chat_id), e)
+                result = SendResult(success=False, error=str(e), retryable=False)
+                return await self._record_response_async(reply_to, result, content, bool(metadata and metadata.get("notify")), metadata)
             logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
             if _is_discord_transport_error(e):
                 # Connection-shaped failure: runtime-retryable marker so the reconnect sweep can replay it.
@@ -3086,6 +3104,15 @@ class DiscordAdapter(DiscordLiveGatesMixin, DiscordCommandSyncMixin, DiscordAuth
             else:
                 result = SendResult(success=False, error=str(e))
             return await self._record_response_async(reply_to, result, content, bool(metadata and metadata.get("notify")), metadata)
+
+    def _log_unknown_channel(self, target: str, error: BaseException) -> None:
+        """WARNING once per target while it stays deleted, DEBUG after; a successful send re-arms it."""
+        if target in self._unknown_channel_warned:
+            logger.debug("[%s] Discord channel %s is still gone: %s", self.name, target, error)
+            return
+        self._unknown_channel_warned.add(target)
+        logger.warning("[%s] Discord channel %s no longer exists (10003); sends to it fail until it is "
+                       "reconfigured: %s", self.name, target, error)
 
     @staticmethod
     def _forum_thread_parts(thread: Any) -> tuple:

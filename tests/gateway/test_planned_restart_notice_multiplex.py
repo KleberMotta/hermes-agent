@@ -110,7 +110,7 @@ async def test_private_home_notices_reach_both_bots(multiplex_runner, outcome):
     runner._profile_configs = {"coder": _home_config(Platform.TELEGRAM, "8776018003")}
     runner._profile_adapters = {"coder": {Platform.TELEGRAM: coder}}
     if outcome == "failure":
-        coder.send.return_value = SendResult(success=False, error="temporary failure")
+        coder.send.return_value = SendResult(success=False, error="send_path_degraded", retryable=True)
 
     await runner._replay_pending_planned_restart_notification()
 
