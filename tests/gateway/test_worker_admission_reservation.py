@@ -67,7 +67,8 @@ async def test_reserved_process_uses_existing_authenticated_adoption_and_persist
         seed_session(db, 'owned', 'cli')
         epoch = db.runtime.begin_epoch(instance_id='owner')
         authority = SimpleNamespace(epoch=epoch, profile_id=str(tmp_path), _require_admission_open=lambda: None,
-                                    wake_after_worker=lambda session_id: None, persistence=db)
+                                    wake_after_worker=lambda session_id, owner=None: None,
+                                    logical_owner=lambda session_id: session_id, persistence=db)
         admitted, _created = db.admissions.admit(epoch=epoch, principal_id='human', session_id='owned', request_id='input', payload={})
         db.admissions.claim(epoch=epoch, session_id='owned')
         scope = reserve_admission_worker(authority, admission_id=admitted.admission_id, process=process, principal_id='human', hello=hello(process))
