@@ -1456,6 +1456,19 @@ goals:
 
 `max_turns` caps how many continuation turns a goal can drive before Hermes auto-pauses it and asks the user to `/goal resume`. It protects against judge false negatives (goal actually done but judge says continue) and unbounded model spend on fuzzy or unachievable goals. See [Goals](./features/goals.md) for the full feature.
 
+### Worker persistence timeouts
+
+A managed worker (a kanban run, for example) saves through the gateway, which answers on its event loop. A stalled gateway can leave one save without a reply; the worker then resends the same entry, which the gateway resolves idempotently, instead of failing the run.
+
+```yaml
+timeouts:
+  worker:
+    receipt_wait: 20.0       # seconds to wait for the gateway's reply to one save
+    receipt_recovery: 180.0  # seconds a save without a reply is resent (jittered pauses) before the failure sticks
+```
+
+`timeouts.worker.receipt_wait` bounds each attempt. `timeouts.worker.receipt_recovery` bounds the whole resend window, counted from the first send; an explicit refusal from the gateway (for example `permission_denied` or `stale_epoch`) ends it at once. Keep the recovery window below the kanban claim TTL so the dispatcher does not reclaim a run that is still resending.
+
 ### API Timeouts
 
 Hermes has separate timeout layers for streaming, plus a stale detector for non-streaming calls. The stale detectors auto-adjust for local providers only when you leave them at their implicit defaults.

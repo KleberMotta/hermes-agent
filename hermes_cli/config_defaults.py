@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- the new timeouts.worker.* defaults (one key, one comment); this pure-data table has no function to move out
 """Default configuration data for Hermes Agent: DEFAULT_CONFIG and OPTIONAL_ENV_VARS.
 
 Pure-data leaf module — must not import from hermes_cli.config. Comments are the user-facing
@@ -2019,6 +2020,9 @@ DEFAULT_CONFIG = {
         # TCP timeout before falling back. True skips IPv6 entirely.
         "force_ipv4": False,
     },
+    # Unified deadlines (agent/deadline.py resolve_timeout), seconds. worker.receipt_wait: one worker.persist
+    # reply; worker.receipt_recovery: how long an unanswered save is resent (keep under the kanban claim TTL).
+    "timeouts": {"worker": {"receipt_wait": 20.0, "receipt_recovery": 180.0}},
     # Gateway monitoring: service health + redacted operational diagnostics exported over OTLP to an
     # operator endpoint (OTEL Collector, DataDog, ...). Content-free by construction: no prompts,
     # messages, tool args/results, session history, usage analytics, audit logs, or trajectories.
