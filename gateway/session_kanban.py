@@ -276,6 +276,7 @@ def _run_worker_turns(agent, frame, history):
                                           **({'task_id': task_id} if task_id else {}),
                                           **({'turn_author': author} if author is not None else {}))
     from hermes_cli.turn_exit import credential_failure_flags, turn_exit_code
+    from hermes_cli import kanban_db as kb
     code, last_output = 1, ''
     try:
         result = _run_task_turns(agent, frame, history, context)
@@ -283,11 +284,14 @@ def _run_worker_turns(agent, frame, history):
         if isinstance(result, dict):
             # Redact before the tail cut: a cut through a PEM header or a token prefix
             # leaves a body the redactor no longer recognises.
-            from hermes_cli import kanban_db as kb
             last_output = kb.redact_review_value(str(result.get('final_response') or ''))[-500:]
+            if code != 0 and not last_output:
+                last_output = kb.redact_review_value(_turn_death_reason(result))[-500:]
         return result
     except Exception as exc:
         code = turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc))
+        # Redact, then cut from the start: the exception's name is what the card needs to keep.
+        last_output = kb.redact_review_value(f'{type(exc).__name__}: {exc}')[:500]
         raise
     finally:
         _record_worker_result(context, code, last_output)
@@ -299,8 +303,17 @@ def record_start_failure(frame, exc):
     context = json.loads(frame['policy'].get('kanban_json') or 'null')
     if context is None:
         return
+    from hermes_cli import kanban_db as kb
     from hermes_cli.turn_exit import credential_failure_flags, turn_exit_code
-    _record_worker_result(context, turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc)), '')
+    _record_worker_result(context, turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc)),
+                          kb.redact_review_value(f'{type(exc).__name__}: {exc}')[:500])
+
+
+def _turn_death_reason(result):
+    """Why a failed turn left no reply: the first useful reason the turn result carries."""
+    reason = result.get('turn_exit_reason')
+    return str(result.get('error') or result.get('interrupt_message')
+               or (reason if reason and reason != 'unknown' else '') or 'interrupted')
 
 
 def _record_worker_result(context, code, last_output):

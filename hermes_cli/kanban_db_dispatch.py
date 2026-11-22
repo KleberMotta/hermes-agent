@@ -1000,7 +1000,8 @@ def _exit_summary_marker() -> str:
 
 def _log_noise_prefixes() -> tuple[str, ...]:
     from agent.i18n import t
-    return ("session_id:", "Query:", t("cli.chat.initializing_agent"))
+    # ``Session: local-…`` is the worker client's own admission line, not the worker's output.
+    return ("session_id:", "Session: local-", "Query:", t("cli.chat.initializing_agent"))
 
 
 def _worker_final_output(task_id: str, board: Optional[str] = None) -> str:
