@@ -49,6 +49,12 @@ from persistence.sqlite.conversation._store.search import search_messages
 from persistence.sqlite.conversation._store.sessions import create_session, get_session
 
 
+@pytest.fixture()
+def process_ceiling_24(monkeypatch):
+    """The process ceiling a descriptor-poor host sizes itself to; keeps the many-file tests small."""
+    monkeypatch.setattr(readpool_module, "_process_read_permits", readpool_module._PermitCounter(24))
+
+
 def _live_count(path) -> int:
     """Live-connection count the tracking registry holds for *path*."""
     import hermes_cli.sqlite_safe_read as mod
@@ -478,10 +484,10 @@ def test_idle_permits_are_reclaimed_from_a_peer_instance(db):
 
 
 @pytest.mark.requires_wal
-def test_peak_is_bounded_across_many_database_files(tmp_path):
+def test_peak_is_bounded_across_many_database_files(tmp_path, process_ceiling_24):
     """Read connections must be capped for the PROCESS, not just per file."""
     from persistence.sqlite._state.readpool import _READ_POOL_MAX
-    from persistence.sqlite._state.readpool import _READ_POOL_PROCESS_MAX
+    _READ_POOL_PROCESS_MAX = 24
 
     n_files = (_READ_POOL_PROCESS_MAX // _READ_POOL_MAX) + 2
     dbs = []
@@ -528,10 +534,10 @@ def test_peak_is_bounded_across_many_database_files(tmp_path):
 
 
 @pytest.mark.requires_wal
-def test_idle_connections_are_reclaimed_across_database_files(tmp_path):
+def test_idle_connections_are_reclaimed_across_database_files(tmp_path, process_ceiling_24):
     """A quiet profile's idle connections must not starve the busy one."""
     from persistence.sqlite._state.readpool import _READ_POOL_MAX
-    from persistence.sqlite._state.readpool import _READ_POOL_PROCESS_MAX
+    _READ_POOL_PROCESS_MAX = 24
 
     quiet = []
     try:

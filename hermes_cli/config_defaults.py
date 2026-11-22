@@ -36,6 +36,11 @@ DEFAULT_CONFIG = {
         # WAL sizing pragmas (ints). None = SQLite defaults (autocheckpoint 1000 pages, no limit).
         "wal_autocheckpoint": None,
         "journal_size_limit": None,
+        # Read-only SQLite connections alive at once: per state.db file, and across the whole process (a
+        # multiplexed gateway opens one state.db per profile). None = auto: 8 per file; per process 24 when
+        # the fd soft limit is below 1024, else 192. The process value is read from the launch home only.
+        "read_pool_max": None,
+        "read_pool_process_max": None,
     },
     # Server-process fd soft limit (clamped to the hard limit) + glibc arena cap; 0/false/null = off.
     "runtime": {"nofile_soft_limit": 4096, "malloc_arena_max": 4},
