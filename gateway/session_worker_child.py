@@ -7,7 +7,7 @@ policy's delegation caps. The child then persists through the ordinary ``worker.
 under its own claim. Expected refusals (caps, draining) are receipts, not errors: an error would
 leave the parent's journal pending and refuse every later write of its turn.
 """
-from gateway.session_persistence import authority_persistence
+from gateway.session_persistence import authority_persistence, run_off_loop
 from persistence.core.errors import AuthorityRefusal
 from persistence.workers.delegations import WorkerDelegationPayload
 from persistence.workers.vocabulary import CHILD_SEPARATOR
@@ -39,18 +39,18 @@ def delegation_limits(authority, execution_id, session_id):
 
 async def worker_child_request(connection, ref, params):
     """worker.persist ``child.reserve``: the parent's full claim and assignment are verified first."""
-    import asyncio
     from gateway.session_worker import _SCOPE, _claim, _verify
     if set(params) != _SCOPE | {'epoch', 'sequence', 'operation', 'payload'}:
         raise AuthorityRefusal('invalid_params')
-    claim = _claim(connection, ref, params)
-    if 'worker:adopt' not in connection.actor.capabilities:
-        raise AuthorityRefusal('permission_denied')
-    _verify(connection, ref, params, claim)
     authority = connection.authority
     workers = authority_persistence(authority).worker_executions
 
     def reserve():
+        # Claim and verification run here, off the loop, in the same call as the reservation.
+        claim = _claim(connection, ref, params)
+        if 'worker:adopt' not in connection.actor.capabilities:
+            raise AuthorityRefusal('permission_denied')
+        _verify(connection, ref, params, claim)
         refused, limits = None, (0, 0)
         try:
             authority._require_admission_open()
@@ -67,4 +67,4 @@ async def worker_child_request(connection, ref, params):
             return {'refused': reservation.refused}
         return {'child': {'session_id': child.session_id, 'execution_id': child.execution_id,
                           'generation': child.generation}}
-    return await asyncio.to_thread(reserve)
+    return await run_off_loop(authority, reserve)

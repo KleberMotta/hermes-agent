@@ -10,6 +10,7 @@ import asyncio
 import logging
 from functools import partial
 
+from gateway.session_persistence import run_off_loop
 from persistence.core.errors import AuthorityRefusal
 
 logger = logging.getLogger(__name__)
@@ -53,7 +54,9 @@ async def adopt_before_restore(authority, sid, *, tracked=True):
     """Commit *sid*'s due catch-up in a worker, so the restore that follows only reads.
 
     ``tracked=False``: an authority still being built, not yet published for retirement to join."""
-    receipt = _due(authority, sid)
+    # Runs on every RPC for a session the authority does not hold yet (a compression child after a
+    # rotation): its reads wait on the writer lock when the read pool is exhausted, so not on the loop.
+    receipt = await run_off_loop(authority, _due, authority, sid)
     if receipt is None:
         return
     write = partial(_adopt, authority, sid, receipt)

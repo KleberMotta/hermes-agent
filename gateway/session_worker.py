@@ -3,15 +3,30 @@
 Only explicit local compute registrations are enabled here. A delegated child is reserved by
 the owner on its parent's receipt stream (gateway/session_worker_child.py), never registered.
 """
-import asyncio
+import functools
 import os
 from dataclasses import asdict
 
 from persistence.authority.vocabulary import admission_fingerprint
-from gateway.session_persistence import authority_persistence
+from gateway.session_persistence import authority_persistence, run_off_loop
 from persistence.core.errors import AuthorityRefusal
 
 _SCOPE = {'profile_id', 'session_id', 'execution_id', 'generation', 'pid', 'birth', 'secret'}
+
+
+@functools.lru_cache(maxsize=1)
+def _own_username():
+    """This process's user name, read once: it cannot change, and each psutil read is an OS call."""
+    import psutil
+    return psutil.Process().username()
+
+
+def _is_zombie(process):
+    """Windows has no zombies, and psutil's Windows ``status()`` (NtQuerySystemInformation) does not release
+    the GIL: under load it froze every thread of the gateway (#142085, same skip as
+    ``hermes_cli.process_identity``)."""
+    import psutil
+    return os.name != 'nt' and process.status() == psutil.STATUS_ZOMBIE
 
 
 def _claim(connection, ref, params):
@@ -30,8 +45,8 @@ def _claim(connection, ref, params):
         process = psutil.Process(pid)
         from hermes_cli.process_identity import worker_birth
         if (worker_birth(process) != birth or not process.is_running()
-                or process.status() == psutil.STATUS_ZOMBIE
-                or process.username() != psutil.Process().username()):
+                or _is_zombie(process)
+                or process.username() != _own_username()):
             raise AuthorityRefusal('permission_denied')
     except psutil.Error as exc:
         raise AuthorityRefusal('worker_not_live') from exc
@@ -64,12 +79,20 @@ async def worker_request(connection, ref, params, *, operation):
     extra = {'register': {'kind'}, 'adopt': set(), 'persist': {'epoch', 'sequence', 'operation', 'payload'}}[operation]
     if set(params) != _SCOPE | extra:
         raise AuthorityRefusal('invalid_params')
-    claim = _claim(connection, ref, params)
     authority = connection.authority
+    scope = {key: params[key] for key in ('execution_id', 'session_id', 'generation')}
+    if operation == 'persist':
+        # Claim, verification, the write and the logical-owner read are ONE call off the loop: each is a
+        # psutil/SQLite call that can wait on the profile's writer lock, and the loop answers every
+        # worker of every profile. Only the in-memory scheduling stays here.
+        result, owner = await run_off_loop(authority, _persist_blocking, connection, ref, params, scope)
+        if owner is not None:
+            # Queued input parked behind this worker; nothing else would restart its FIFO.
+            authority.wake_after_worker(params['session_id'], owner)
+        return result
+    claim = await run_off_loop(authority, _claim, connection, ref, params)
     if operation == 'register':
         authority._require_admission_open()
-    scope = {key: params[key] for key in ('execution_id', 'session_id', 'generation')}
-    if operation == 'register':
         # Only a worker-adoption ticket (what a launched worker carries): an interactive client
         # must not park a 'registered' row that nothing reaps (the FIFO would pause until restart).
         authority.authorize(connection.actor, ref, 'worker:adopt')
@@ -79,14 +102,21 @@ async def worker_request(connection, ref, params, *, operation):
             epoch=authority.epoch, **scope, kind='compute', adoption_secret=claim, require_idle=True))
     if 'worker:adopt' not in connection.actor.capabilities:
         raise AuthorityRefusal('permission_denied')
+    await run_off_loop(authority, _verify, connection, ref, params, claim)
+    return asdict(await authority_persistence(authority).aio.worker_executions.adopt(
+        epoch=authority.epoch, **scope, adoption_secret=claim))
+
+
+def _persist_blocking(connection, ref, params, scope):
+    """The whole blocking part of ``worker.persist`` (runs on a worker thread): ``(receipt, logical owner
+    to wake or None)``. Never touches the loop."""
+    claim = _claim(connection, ref, params)
+    if 'worker:adopt' not in connection.actor.capabilities:
+        raise AuthorityRefusal('permission_denied')
     _verify(connection, ref, params, claim)
-    if operation == 'adopt':
-        return asdict(await authority_persistence(authority).aio.worker_executions.adopt(
-            epoch=authority.epoch, **scope, adoption_secret=claim))
-    result = await asyncio.to_thread(authority_persistence(authority).worker_executions.persist_operation,
+    authority = connection.authority
+    result = authority_persistence(authority).worker_executions.persist_operation(
         epoch=params['epoch'], **scope, sequence=params['sequence'], operation=params['operation'],
         payload=params['payload'])
-    if params['operation'] == 'execution.finish':
-        # Queued input parked behind this worker; nothing else would restart its FIFO.
-        authority.wake_after_worker(params['session_id'])
-    return result
+    owner = authority.logical_owner(params['session_id']) if params['operation'] == 'execution.finish' else None
+    return result, owner
