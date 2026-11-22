@@ -14,11 +14,26 @@ import logging
 import os
 from pathlib import Path
 import queue
+import random
 import sys
 import threading
+import time
+from agent.deadline import resolve_timeout
 from hermes_dir_acl import make_user_dir
 
 logger = logging.getLogger(__name__)
+
+# One call's wait for the owner's reply, and how long a journal entry keeps being resent after the
+# owner stops answering. The second matches ``OWNER_WAIT_S`` in ``hermes_cli.kanban_worker_client``
+# (the longest the submitter waits on a silent owner); it is repeated here because that module is a
+# bootstrap entry point the agent package must not import.
+# Both are defaults for ``timeouts.worker.receipt_wait`` / ``timeouts.worker.receipt_recovery``.
+RECEIPT_WAIT_S = 20.0
+RECEIPT_RECOVERY_S = 180.0
+# Full-jitter pause between resends: uniform(floor, min(cap, floor * 2**attempt, remaining)). The jitter
+# keeps every worker of a profile from redialling a just-unstalled owner in the same instant.
+_RESEND_PAUSE_FLOOR_S = 0.25
+_RESEND_PAUSE_CAP_S = 2.0
 
 _worker_process = False
 
@@ -45,6 +60,26 @@ def apply_row_annotations(messages, annotations):
 
 class WorkerPersistenceError(RuntimeError):
     pass
+
+
+class WorkerOwnerUnavailable(WorkerPersistenceError):
+    """Gateway discovery failed before a worker RPC request was sent."""
+
+
+class WorkerStorageUnavailable(WorkerPersistenceError):
+    """The owner answered 5001 ``storage_unavailable``: its store failed, nothing says the entry landed.
+
+    The only owner-side error that is resent; every 4001 refusal (permission_denied, stale_epoch,
+    invalid_params, admission_conflict, owner_unavailable...) is the owner's final answer.
+    """
+
+
+class WorkerReceiptTimeout(TimeoutError):
+    """The owner did not answer a sent request within ``RECEIPT_WAIT_S``: its outcome is unknown.
+
+    Typically the owner's event loop stalled (memory pressure). Journal entries are idempotent per
+    (execution, sequence, digest), so ``RuntimeSessionStore`` resends the same entry on a new connection.
+    """
 
 
 def _caller_summary(limit=8):
@@ -109,7 +144,7 @@ class _OwnerLink:
         try:
             reply = self.replies.get(timeout=timeout)
         except queue.Empty:
-            raise TimeoutError('worker_receipt_timeout') from None
+            raise WorkerReceiptTimeout('worker_receipt_timeout') from None
         if isinstance(reply, BaseException):
             raise reply
         return reply
@@ -128,6 +163,7 @@ class WorkerRPC:
         self.endpoint = None
         self.link = None
         self.request_id = 0
+        self.receipt_wait_s = resolve_timeout('worker.receipt_wait', default=RECEIPT_WAIT_S)
 
     def _connection(self):
         if self.link is not None:
@@ -144,7 +180,7 @@ class WorkerRPC:
         if discovery.state == 'ready' and discovery.endpoint is not None:
             self.endpoint = discovery.endpoint
         elif discovery.state != 'draining' or self.endpoint is None:
-            raise WorkerPersistenceError('owner_unavailable')
+            raise WorkerOwnerUnavailable('owner_unavailable')
         from hermes_cli.gateway_runtime import control_home_for
         endpoint = self.endpoint
         descriptor = query_identify(control_home_for(self.home, endpoint), timeout=5)
@@ -194,13 +230,22 @@ class WorkerRPC:
                     self._drop()
                     link = self._connection()
                     link.send(request_id, message)
-                response = link.receive(20)
+                try:
+                    response = link.receive(self.receipt_wait_s)
+                except ConnectionClosed as exc:
+                    # Past the send the owner may have committed before the link died: the caller
+                    # still gets the transport error, marked so the store knows the outcome is unknown.
+                    exc.after_send = True
+                    raise
             except BaseException:
-                # Outcome unknown once sent: surface the error and never resend; the next call redials.
+                # Outcome unknown once sent: surface the error and never resend here; the next call
+                # redials. Only the store resends, and only a journal entry (an exact-retry receipt).
                 self._drop()
                 raise
             if 'error' in response:
-                raise WorkerPersistenceError(response['error'].get('message', 'persistence_failed'))
+                error = response['error']
+                refusal = WorkerStorageUnavailable if error.get('code') == 5001 else WorkerPersistenceError
+                raise refusal(error.get('message', 'persistence_failed'))
             if method in ('worker.register', 'worker.adopt') and params.get('pid') == os.getpid():
                 global _worker_process
                 _worker_process = True
@@ -223,8 +268,17 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
     # The process's async-delegation ledger belongs to the adopted execution, never a reserved child.
     binds_delegation_ledger = True
 
-    def __init__(self, rpc, scope, outbox_dir, adopted=None, *, max_bytes=4 * 1024 * 1024):
+    def __init__(self, rpc, scope, outbox_dir, adopted=None, *, max_bytes=4 * 1024 * 1024,
+                 receipt_recovery_s=None, clock=time.monotonic, sleep=None, uniform=random.uniform):
         self.rpc = rpc
+        if receipt_recovery_s is None:
+            receipt_recovery_s = resolve_timeout('worker.receipt_recovery', default=RECEIPT_RECOVERY_S)
+        self.receipt_recovery_s = receipt_recovery_s
+        self._clock = clock
+        self._uniform = uniform
+        # Resend pauses wait on this event, so ``abort_resend`` ends them (and the loop) at once.
+        self._abort_resend = threading.Event()
+        self._sleep = sleep or self._abort_resend.wait
         self.scope = dict(scope)
         self.max_bytes = max_bytes
         self.lock = threading.RLock()
@@ -336,7 +390,7 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
             try:
                 while self.journal['pending']:
                     entry = self.journal['pending'][0]
-                    result = self.rpc('worker.persist', **self.scope, **entry)
+                    result = self._send_entry(entry)
                     candidate = dict(self.journal, pending=self.journal['pending'][1:])
                     candidate = self._compression_receipt_journal(candidate, result)
                     self._save(candidate)
@@ -348,6 +402,47 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                 raise
             self.failure = None
             return results
+
+    def _send_entry(self, entry):
+        """``worker.persist`` for one journal entry, resent while its outcome stays unknown.
+
+        A receipt timeout, or a connection closed after the send, leaves the outcome unknown (the owner
+        may have committed it), which is what the owner's exact-retry receipt resolves: the same scope,
+        sequence and payload return the stored result instead of writing twice. So the same entry is
+        redialled and resent, after a full-jitter pause, until ``receipt_recovery_s`` has passed since
+        the first send; only then does the failure stand (and stick). Once the owner has gone silent, a
+        failed redial (its handshake stalls too) is part of the same stall; a 5001 ``storage_unavailable``
+        is resent too. Any other owner refusal or error is final at once.
+        """
+        started, silent, attempt = self._clock(), False, 0
+        while True:
+            try:
+                return self.rpc('worker.persist', **self.scope, **entry)
+            except Exception as exc:  # health: allow BLE001 -- re-raised unless the outcome is unknown
+                if isinstance(exc, WorkerReceiptTimeout) or getattr(exc, 'after_send', False):
+                    silent = True
+                elif not (isinstance(exc, WorkerStorageUnavailable) or (silent and self._owner_unreachable(exc))):
+                    raise
+                remaining = self.receipt_recovery_s - (self._clock() - started)
+                if remaining <= 0 or self._abort_resend.is_set():
+                    raise
+                logger.warning('worker.persist seq %s: %s; resending on a new connection (%.0fs left)',
+                               entry['sequence'], exc, remaining)
+                cap = min(_RESEND_PAUSE_CAP_S, _RESEND_PAUSE_FLOOR_S * 2 ** min(attempt, 10), remaining)
+                self._sleep(self._uniform(min(_RESEND_PAUSE_FLOOR_S, cap), cap))
+                attempt += 1
+
+    def abort_resend(self):
+        """End a running or future resend loop at its next pause; it surfaces the last error.
+
+        Lock-free on purpose: ``retry_pending`` holds ``self.lock`` while it resends.
+        """
+        self._abort_resend.set()
+
+    @staticmethod
+    def _owner_unreachable(exc):
+        from websockets.exceptions import ConnectionClosed
+        return isinstance(exc, (TimeoutError, OSError, ConnectionClosed, WorkerOwnerUnavailable))
 
     def adopt(self, epoch):
         """Install only a separately verified worker.adopt result; never self-adopt."""
