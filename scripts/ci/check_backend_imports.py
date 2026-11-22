@@ -56,6 +56,10 @@ _HOME_READS: dict[tuple[str, str], str] = {
     ("persistence/sqlite/_state/repair.py", "get_hermes_home"): "the writability preflight checks the process home",
     ("persistence/sqlite/_backend.py", "get_hermes_home"):
         "a store's open binds its own profile folder as the home only when it differs from the current one",
+    ("persistence/sqlite/_backend.py", "load_config_readonly"):
+        "the open reads the read-pool ceilings (database.read_pool_*) from the config of the home it just bound",
+    ("persistence/sqlite/_backend.py", "get_process_hermes_home"):
+        "the read-pool process ceiling is taken from the launch home only: every served profile shares it",
 }
 
 

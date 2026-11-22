@@ -182,6 +182,19 @@ def _home_bound(home: Path) -> Iterator[None]:
             token.reset()
 
 
+def _configure_read_pool(path: Path) -> None:
+    """Read-pool ceilings from the config of the home being opened (call under ``_home_bound``): the per-file one
+    from every profile, the process one only from the launch home, which every profile's reads share."""
+    from hermes_cli.config import cfg_get, load_config_readonly
+    from hermes_constants import get_process_hermes_home, hermes_home_key
+    from persistence.sqlite._state.readpool import configure_read_pool
+
+    cfg = load_config_readonly()
+    launch = hermes_home_key(path.parent) == hermes_home_key(get_process_hermes_home())
+    configure_read_pool(path, per_file=cfg_get(cfg, "database", "read_pool_max", default=None),
+                        process=cfg_get(cfg, "database", "read_pool_process_max", default=None) if launch else None)
+
+
 class SQLiteBackend:
     """Every store one assembly was built for; ``open(scope)`` binds a handle to one of them. See the module
     docstring."""
@@ -251,6 +264,7 @@ class SQLiteBackend:
             if current is not None and (self.read_only or not reacquire):
                 return current
         with translated(), _home_bound(path.parent):
+            _configure_read_pool(path)
             fresh = (StoreHolder(path, read_only=True, read_patience_s=self._read_patience_s,
                                  check_drift=self._check_drift) if self.read_only
                      else _registry.acquire(path))

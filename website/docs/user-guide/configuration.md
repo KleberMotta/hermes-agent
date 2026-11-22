@@ -160,7 +160,13 @@ database:
   # Optional WAL sizing pragmas (integers). Unset = SQLite defaults.
   # wal_autocheckpoint: 1000     # pages between automatic checkpoints
   # journal_size_limit: 67108864 # cap the WAL/journal size in bytes
+
+  # Read-pool ceilings (positive integers). Unset = automatic.
+  # read_pool_max: 8             # read-only connections alive at once per state.db file
+  # read_pool_process_max: 192   # ... across the whole process (all profiles of a gateway)
 ```
+
+`database.read_pool_max` defaults to 8. `database.read_pool_process_max` defaults to 24 when the process's open-file soft limit is below 1024 and to 192 when it is higher or cannot be measured (Windows); it is read from the launch profile's `config.yaml` only, because every profile served by the process shares it. When a ceiling is reached, reads fall back to the writer connection and wait behind in-flight writes; the warning `read pool at capacity (per-db 8 | process 192 | fd-headroom N free ...)` names the ceiling that refused.
 
 Hermes also warns (once per process per database) when an existing
 database's on-disk journal mode is silently flipped to WAL on open — for

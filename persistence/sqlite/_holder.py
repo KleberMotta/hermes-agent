@@ -43,7 +43,7 @@ from persistence.sqlite._state.guard import (
     _register_test_instance,
 )
 from persistence.sqlite._state.readpool import (
-    _READ_POOL_MAX, _proc_fd_targets, _read_budget_for, note_read_pool_exhausted,
+    _proc_fd_targets, _read_budget_for, note_read_pool_exhausted,
 )
 from persistence.sqlite._state import holders as _state_holders
 from persistence.sqlite._state import lockguard as _lockguard
@@ -322,7 +322,8 @@ class StoreHolder:
         # Read-path split (WAL only): reads borrow from a BOUNDED read-only pool so they
         # never queue behind writer flushes on self._lock (see _read_ctx); unbounded
         # per-thread connections pinned fds for the process lifetime and hit EMFILE.
-        self._read_pool: queue.LifoQueue[sqlite3.Connection] = queue.LifoQueue(maxsize=_READ_POOL_MAX)
+        self._read_budget = _read_budget_for(self.db_path)
+        self._read_pool: queue.LifoQueue[sqlite3.Connection] = queue.LifoQueue(maxsize=self._read_budget.limit)
         # Permits bound PEAK descriptors (the pool bounds only the idle set), shared per
         # DATABASE PATH; acquired non-blocking so a permitless reader degrades to the writer lock.
         # One permit per live read connection, held from before the open in _get_read_conn() until after the
@@ -331,7 +332,6 @@ class StoreHolder:
         # exhaustion into a stall, which is the same outage with a different stack trace. Permits are shared
         # per DATABASE PATH, not per instance: the descriptors they ration belong to the file, and one
         # process holds several store objects on the same state.db (#98573). See _PathReadBudget.
-        self._read_budget = _read_budget_for(self.db_path)
         self._read_permits = self._read_budget.permits
         self._read_conns_lock = threading.Lock()
         # Set when close() begins; an in-flight reader then closes its own connection
@@ -600,7 +600,7 @@ class StoreHolder:
                 return None
         # Permit BEFORE the open: openers race for permits, not descriptors.
         if not self._read_budget.acquire(self):
-            note_read_pool_exhausted(self.db_path)
+            note_read_pool_exhausted(self.db_path, self._read_budget.take_denial())
             return None
         conn = None  # bound before the try so the handlers can close a half-open one
         try:

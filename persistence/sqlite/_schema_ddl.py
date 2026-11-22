@@ -303,6 +303,11 @@ CREATE TABLE IF NOT EXISTS worker_receipts (
     PRIMARY KEY (execution_id, sequence)
 );
 
+-- Serves worker_claim_origin (workers/_compression.py): the first receipt of an execution that names a parent.
+-- The WHERE must match that query's clause text exactly or the planner will not use the index.
+CREATE INDEX IF NOT EXISTS idx_worker_receipts_claim_origin ON worker_receipts(execution_id, sequence)
+    WHERE json_extract(result_json,'$.worker_assignment.parent') IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS state_meta (
     key TEXT PRIMARY KEY,
     value TEXT
