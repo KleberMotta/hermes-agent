@@ -113,6 +113,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "rate_limited": res.rate_limited,
             "skipped_locked": res.skipped_locked,
             "memory_pressure": res.memory_pressure,
+            "spawn_capped": res.spawn_capped,
+            "claim_lost": [
+                {"task_id": tid, "reason": reason} for (tid, reason) in res.claim_lost
+            ],
         }, ascii=True)
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -154,6 +158,16 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print("Skipped: another dispatcher holds this board's lock (no writes this tick)")
     if res.memory_pressure:
         print(f"Memory pressure {res.memory_pressure}: new workers restricted this tick")
+    capped = res.spawn_capped
+    if capped:
+        if capped.get("cap") == "max_spawn":
+            print(f"Capped: --max/kanban.max_spawn={capped.get('limit')} counts this board's running "
+                  f"tasks ({capped.get('running')} running); no claim attempted")
+        else:
+            print(f"Capped: kanban.max_in_progress={capped.get('limit')} reached "
+                  f"({capped.get('running')} running on all boards); no claim attempted")
+    for tid, reason in res.claim_lost:
+        print(f"Claim lost ({reason}): {tid}")
     return 0
 
 

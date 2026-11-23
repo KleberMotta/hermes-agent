@@ -150,6 +150,16 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    spawn_capped: Optional[dict] = None
+    """Set when a concurrency cap left this tick no spawn slot, so no claim was
+    even attempted: ``{"cap": "max_spawn"|"max_in_progress", "limit": N,
+    "running": M}`` (``max_spawn`` counts this board's running tasks,
+    ``max_in_progress`` every board's). Without it a capped tick reports a bare
+    ``Spawned: 0`` while a dry run lists the same rows."""
+    claim_lost: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, reason)`` rows that passed every gate but whose claim CAS
+    returned None (``status=<s>``, ``claimed_by_other``, ``reassigned``,
+    ``parents_not_done``). Each also leaves a ``claim_lost`` event on the card."""
 
 
 def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
@@ -175,6 +185,11 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
             pressure = res.memory_pressure
+        if res.spawn_capped:
+            key = str(res.spawn_capped.get("cap") or "capped")
+            counts[key] = counts.get(key, 0) + 1
+        if res.claim_lost:
+            counts["claim_lost"] = counts.get("claim_lost", 0) + len(res.claim_lost)
     parts = [f"{k}={v}" for k, v in sorted(counts.items())]
     if pressure:
         parts.append(f"memory_pressure={pressure}")
@@ -2108,6 +2123,41 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
 
 
+def _claim_lost_reason(conn: sqlite3.Connection, task_id: str, assignee: str, lane: str) -> str:
+    """Why a gated row's claim CAS returned None, read back after the attempt."""
+    row = conn.execute(
+        "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None:
+        return "deleted"
+    last = conn.execute(
+        "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    if last is not None and last["kind"] in ("claim_rejected", "dependency_wait"):
+        return "parents_not_done"
+    if row["claim_lock"] is not None:
+        return "claimed_by_other"
+    if row["status"] != lane:
+        return f"status={row['status']}"
+    if (row["assignee"] or "") != (assignee or ""):
+        return "reassigned"
+    return "cas_lost"
+
+
+def _record_claim_lost(
+    conn: sqlite3.Connection, task_id: str, assignee: str, lane: str, result: DispatchResult,
+) -> None:
+    """Name a lost claim on the result and, once, on the card (``claim_task``
+    already wrote ``claim_rejected`` for the parents case, so no second row)."""
+    reason = _claim_lost_reason(conn, task_id, assignee, lane)
+    result.claim_lost.append((task_id, reason))
+    _kb._log.info("kanban dispatch: claim of %s lost (%s)", task_id, reason)
+    if reason in ("parents_not_done", "deleted"):
+        return
+    with contextlib.suppress(Exception), _kb.write_txn(conn):
+        _kb._append_event(conn, task_id, "claim_lost", {"reason": reason, "lane": lane, "assignee": assignee})
+
+
 def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -2184,6 +2234,7 @@ def _dispatch_lane_task(
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task  # reassigned since the gates: CAS loses (#147534)
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds, expect_assignee=assignee)
     if claimed is None:
+        _record_claim_lost(conn, task_id, assignee, lane, result)
         return False
     try:
         resolved_branch_name = None
@@ -2287,12 +2338,14 @@ def _tick_spawn_budget(
     # Both ready and review loops consume from the same budget.
     if max_spawn is not None:
         if running_count >= max_spawn:
+            result.spawn_capped = {"cap": "max_spawn", "limit": max_spawn, "running": running_count}
             return False, None
         spawn_budget = max_spawn - running_count
 
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            result.spawn_capped = {"cap": "max_in_progress", "limit": max_in_progress, "running": total_running}
             return False, None
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
