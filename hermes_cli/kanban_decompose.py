@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -336,8 +337,43 @@ def decompose_task(
     return _apply_fanout(task_id, parsed, routing, audit_author)
 
 
-def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+# A task that keeps hitting block_loop_detected is waiting for a human: its worker
+# keeps refusing the same thing. Re-specifying and promoting it again only buys another
+# worker run and another refusal (t_29fd420c looped 577 times this way). Past this count
+# in the window, the sweep leaves it in triage; ``decompose <id>`` still works on it.
+BLOCK_LOOP_SKIP_COUNT = 3
+BLOCK_LOOP_SKIP_WINDOW_S = 24 * 3600
+
+
+def _block_loop_ids(conn, ids: list[str], now: int) -> set[str]:
+    """Ids among ``ids`` with >= BLOCK_LOOP_SKIP_COUNT block_loop_detected in the window."""
+    if not ids:
+        return set()
+    marks = ",".join("?" * len(ids))
+    rows = conn.execute(
+        f"SELECT task_id FROM task_events WHERE kind = 'block_loop_detected' "
+        f"AND created_at >= ? AND task_id IN ({marks}) "
+        f"GROUP BY task_id HAVING COUNT(*) >= ?",
+        (now - BLOCK_LOOP_SKIP_WINDOW_S, *ids, BLOCK_LOOP_SKIP_COUNT),
+    ).fetchall()
+    return {r[0] for r in rows}
+
+
+def list_triage_ids(
+    *, tenant: Optional[str] = None, include_block_loops: bool = False, now: Optional[int] = None,
+) -> list[str]:
+    """Task ids in the triage column, minus block-loop tasks unless ``include_block_loops``.
+
+    Used by the gateway auto-decompose sweep and ``decompose --all``.
+    """
     with kbc.connect_closing() as conn:
         rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000)
-    return [row.id for row in rows]
+        ids = [row.id for row in rows]
+        if include_block_loops:
+            return ids
+        skip = _block_loop_ids(conn, ids, int(time.time()) if now is None else int(now))
+    if skip:
+        # debug, not info: the sweep runs every tick and the task may sit in triage for hours
+        logger.debug("kanban decompose: leaving %d block-loop task(s) in triage: %s",
+                    len(skip), ", ".join(sorted(skip)))
+    return [tid for tid in ids if tid not in skip]
