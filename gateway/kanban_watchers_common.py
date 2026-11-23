@@ -46,20 +46,26 @@ def _board_slugs(kb: Any) -> list:
     return [b.get("slug") or kb.DEFAULT_BOARD for b in _list_boards(kb)]
 
 
-def _positive_int_setting(kanban_cfg: dict, key: str) -> Optional[int]:
-    """Parse an optional ``kanban.<key>`` int cap; None when unset or invalid (< 1 is invalid)."""
+def _positive_int_setting(kanban_cfg: dict, key: str, *, quiet: bool = False) -> Optional[int]:
+    """Parse an optional ``kanban.<key>`` int cap; None when unset or invalid (< 1 is invalid).
+
+    ``quiet`` skips the logging (per-tick live re-reads would repeat it every tick).
+    """
     raw = kanban_cfg.get(key)
     if raw is None:
         return None
     try:
         value = int(raw)
     except (TypeError, ValueError):
-        logger.warning("kanban dispatcher: invalid kanban.%s=%r; ignoring", key, raw)
+        if not quiet:
+            logger.warning("kanban dispatcher: invalid kanban.%s=%r; ignoring", key, raw)
         return None
     if value < 1:
-        logger.warning("kanban dispatcher: kanban.%s=%r is below 1; ignoring", key, raw)
+        if not quiet:
+            logger.warning("kanban dispatcher: kanban.%s=%r is below 1; ignoring", key, raw)
         return None
-    logger.info("kanban dispatcher: %s=%d", key, value)
+    if not quiet:
+        logger.info("kanban dispatcher: %s=%d", key, value)
     return value
 
 

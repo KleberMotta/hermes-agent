@@ -31,7 +31,13 @@ _CORRUPT_DB_MARKERS = ("file is not a database", "database disk image is malform
 
 @dataclass
 class _DispatcherSettings:
-    """``kanban.*`` dispatch settings, read once at boot (restart to apply)."""
+    """``kanban.*`` dispatch settings, read once at boot (restart to apply).
+
+    Exception: the concurrency caps (``max_in_progress`` and
+    ``max_in_progress_per_profile``) are re-read every tick by
+    :meth:`_KanbanDispatcher.refresh_caps`, so lowering them under memory/disk
+    pressure (and raising them back) takes effect without a restart.
+    """
 
     interval: float
     max_spawn: Any
@@ -132,9 +138,50 @@ class _KanbanDispatcher:
         self.kb = kb
         self.settings = settings
         self.disabled_corrupt_boards: dict[str, tuple[tuple[str, int | None, int | None], float]] = {}
+        self._ticks = 0
 
     def _board_slugs(self) -> list:
         return _board_slugs(self.kb)
+
+    def refresh_caps(self, load_config: Any) -> None:
+        """Re-read ``kanban.max_in_progress`` / ``max_in_progress_per_profile`` from live config.
+
+        Boot-only caps went stale: a cap lowered under memory pressure and
+        raised back later stayed at the boot value until a restart (a gateway
+        that booted while the cap was 2 kept 2 for hours after config said 32).
+        Same parsing as boot; a config read error keeps the current values.
+        """
+        try:
+            cfg = load_config()
+            kanban_cfg = (cfg.get("kanban") if isinstance(cfg, dict) else None) or {}
+            new_values = {
+                "max_in_progress": _kbd().resolve_max_in_progress(
+                    _positive_int_setting(kanban_cfg, "max_in_progress", quiet=True)),
+                "max_in_progress_per_profile": _positive_int_setting(
+                    kanban_cfg, "max_in_progress_per_profile", quiet=True),
+            }
+        except Exception as exc:
+            logger.debug("kanban dispatcher: live cap refresh failed (%s); keeping current caps", exc)
+            return
+        for key, new in new_values.items():
+            old = getattr(self.settings, key)
+            if new != old:
+                logger.info("kanban dispatcher: %s %s -> %s (config changed, applied live)", key, old, new)
+                setattr(self.settings, key, new)
+
+    def _tick_order(self) -> list:
+        """Boards in this tick's order, rotated one step per tick.
+
+        ``max_in_progress`` is a host-wide budget shared by every board; with a
+        fixed order the first board takes every freed slot while it has ready
+        work, and the others starve whenever the cap is tight.
+        """
+        slugs = list(self._board_slugs())
+        if len(slugs) > 1:
+            k = self._ticks % len(slugs)
+            slugs = slugs[k:] + slugs[:k]
+        self._ticks += 1
+        return slugs
 
     def board_db_fingerprint(self, slug: str) -> tuple[str, int | None, int | None]:
         from hermes_cli import kanban_db as _kb
@@ -213,8 +260,8 @@ class _KanbanDispatcher:
                     conn.close()
 
     def tick_once(self) -> list[tuple[str, Optional[object]]]:
-        """Run one dispatch_once per board. Returns (slug, result) pairs."""
-        return [(slug, self.tick_once_for_board(slug)) for slug in self._board_slugs()]
+        """Run one dispatch_once per board (rotating order). Returns (slug, result) pairs."""
+        return [(slug, self.tick_once_for_board(slug)) for slug in self._tick_order()]
 
     def ready_nonempty(self) -> bool:
         """Is there a ready+assigned+unclaimed task on ANY board the dispatcher would spawn for?
