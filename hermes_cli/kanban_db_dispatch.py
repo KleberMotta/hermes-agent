@@ -1047,6 +1047,9 @@ class _DeadWorker:
     event_payload: dict
     protocol_violation: bool = False
     rate_limited: bool = False
+    infrastructure: bool = False
+    """The owner lost the managed child before it said hello: nothing of the card ran, so the
+    host's stall is booked like an infrastructure spawn refusal (never charged, never sticky)."""
     terminal_provider: bool = False
     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
     credential/model — trips the breaker on this first occurrence."""
@@ -1194,6 +1197,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             exit_code = managed_run_exit_code(conn, row["id"], pid, row["claim_lock"])
             dead = _classify_dead_worker(pid, row["claim_lock"], exit_code, task_id=row["id"], board=board)
             apply_attempt_note(conn, row["id"], pid, dead)
+            _mark_pre_bootstrap_loss(dead)
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
@@ -1240,6 +1244,43 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
     return sweep
 
 
+# Owner-recorded ``worker_lost`` reasons that end an attempt before the child received its
+# bootstrap: the card's turn never started, so the loss says nothing about the card.
+_PRE_BOOTSTRAP_LOSS_REASONS = frozenset({"managed_worker_hello_timeout"})
+
+
+def _mark_pre_bootstrap_loss(dead: _DeadWorker) -> None:
+    """Flag a dead worker whose managed child was lost before hello as an infrastructure loss.
+
+    Reads only the owner's structured ``worker_lost`` record (never the worker's own output), so
+    a card cannot talk its way out of the breaker."""
+    lost = dead.event_payload.get("worker_lost") or {}
+    if lost.get("reason") in _PRE_BOOTSTRAP_LOSS_REASONS and lost.get("bound") is False:
+        dead.infrastructure = True
+        dead.event_payload["infrastructure"] = True
+
+
+# Consecutive pre-hello infrastructure losses of ONE card after which it is blocked for an
+# operator. Infrastructure losses are never charged to ``consecutive_failures``, so this is
+# their only bound; the respawn cooldown (``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS``) spaces them.
+_INFRA_LOSS_BLOCK_AFTER = 5
+
+
+def _infra_loss_streak(conn: sqlite3.Connection, task_id: str) -> int:
+    """How many of the card's newest runs, unbroken, are crashed infrastructure losses
+    (capped at ``_INFRA_LOSS_BLOCK_AFTER``): any other run in between ends the streak."""
+    rows = conn.execute(
+        "SELECT outcome, metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT ?",
+        (task_id, _INFRA_LOSS_BLOCK_AFTER),
+    ).fetchall()
+    streak = 0
+    for row in rows:
+        if row["outcome"] != "crashed" or not _kb._json_dict(row["metadata"]).get("infrastructure"):
+            break
+        streak += 1
+    return streak
+
+
 def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]:
     """Count each crash against the breaker; returns the task ids it tripped.
 
@@ -1252,10 +1293,28 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
     auto_blocked: list[str] = []
     fp_counts: dict[str, int] = {}
     for _, _, _, dead in crash_details:
+        if dead.infrastructure:
+            continue  # a host stall is not evidence of a systemic card failure
         fp = _error_fingerprint(dead.error_text)
         fp_counts[fp] = fp_counts.get(fp, 0) + 1
     for tid, pid, claimer, dead in crash_details:
         error_text = dead.error_text
+        if dead.infrastructure:
+            # Stamps last_failure_error only; check_respawn_guard spaces the retry.
+            _record_task_failure(
+                conn, tid, error=error_text, outcome="crashed", release_claim=False,
+                end_run=False, infrastructure=True,
+            )
+            if _infra_loss_streak(conn, tid) >= _INFRA_LOSS_BLOCK_AFTER:
+                # Ordinary block (no ``gave_up``, no breaker count): a card the host keeps
+                # losing before hello waits for an operator instead of cycling forever.
+                if _kb.block_task(
+                    conn, tid, kind="transient",
+                    reason=f"infra: {_INFRA_LOSS_BLOCK_AFTER} perdas antes do hello seguidas "
+                           f"({error_text[:200]})",
+                ):
+                    auto_blocked.append(tid)
+            continue
         if dead.protocol_violation:
             streak = _protocol_violation_streak(conn, tid)
             trow = conn.execute("SELECT max_retries FROM tasks WHERE id = ?", (tid,)).fetchone()
@@ -1596,7 +1655,7 @@ def check_respawn_guard(
         "ORDER BY ended_at DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    if latest_run is not None and latest_run["outcome"] == "spawn_failed":
+    if latest_run is not None and latest_run["outcome"] in ("spawn_failed", "crashed"):
         if rl_cooldown > 0 and _kb._json_dict(latest_run["metadata"]).get("infrastructure"):
             ended_at = _kb._to_epoch(latest_run["ended_at"])
             if ended_at is not None and (now - ended_at) < rl_cooldown:
