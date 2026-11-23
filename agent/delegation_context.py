@@ -119,6 +119,17 @@ def _fenced_kanban_root() -> str:
         return "1"
 
 
+def unfence_gateway_child_env(env: dict[str, str]) -> dict[str, str]:
+    """Drop the delegate fence and worker identity from the env of a gateway daemon being spawned.
+
+    A gateway is a long-lived service, not a descendant of the worker whose shell happened to start it;
+    inheriting the marker would fence its dispatcher and cron out of the board. Mutates and returns ``env``.
+    """
+    for key in (DELEGATED_CHILD_ENV_MARKER, *KANBAN_ENV_KEYS, "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD"):
+        env.pop(key, None)
+    return env
+
+
 def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[str, str]:
     """Remove worker identity, retaining board/location and an inherited write fence.
 

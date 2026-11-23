@@ -87,6 +87,7 @@ def restart_watcher_env(run_argv: list[str], *, host: bool, home: Optional[str])
     """The watcher's ``env=``. Every respawn sheds the supervisor markers, the launcher's own profile
     included: an update armed under a systemd unit carries its ``INVOCATION_ID``, and a respawn holding
     it believes the unit launched it and skips the supervised-gateway guard (#73480)."""
+    from agent.delegation_context import unfence_gateway_child_env
     from hermes_cli.gateway_runtime_start import strip_supervisor_markers
     if host:
         env = _host_gateway_watcher_env()
@@ -94,4 +95,4 @@ def restart_watcher_env(run_argv: list[str], *, host: bool, home: Optional[str])
         env = profile_gateway_restart_env(home or _argv_profile_home(run_argv))
         # None = the launcher's own profile: its env, exported tokens included, still minus the markers.
         env = dict(os.environ) if env is None else env  # health: allow PS-P05 -- respawns the same profile's gateway that armed it
-    return strip_supervisor_markers(env)
+    return strip_supervisor_markers(unfence_gateway_child_env(env))
