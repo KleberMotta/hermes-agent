@@ -210,7 +210,7 @@ class GatewayKanbanWatchersMixin:
         """Resolve config, kanban_db and the singleton lock; None when the dispatcher must not run.
 
         Config is read once at boot (restart to apply), except the auto-decompose
-        toggle which is re-read every tick. The env var is an escape hatch to
+        toggle and the concurrency caps, which are re-read every tick. The env var is an escape hatch to
         disable without editing YAML.
         """
         try:
@@ -305,6 +305,8 @@ class GatewayKanbanWatchersMixin:
                     # See #49638.
                     if _ad_enabled:
                         await _to_thread_process_service(dispatcher.auto_decompose_tick, _ad_per_tick)
+                    # Caps are live too: a lowered/restored max_in_progress applies next tick.
+                    dispatcher.refresh_caps(_load_config)
                     results = await _to_thread_process_service(dispatcher.tick_once)
                     any_spawned = _log_spawn_results(results)
                     ready_pending = await _to_thread_process_service(dispatcher.ready_nonempty)
