@@ -1260,6 +1260,27 @@ def _mark_pre_bootstrap_loss(dead: _DeadWorker) -> None:
         dead.event_payload["infrastructure"] = True
 
 
+# Consecutive pre-hello infrastructure losses of ONE card after which it is blocked for an
+# operator. Infrastructure losses are never charged to ``consecutive_failures``, so this is
+# their only bound; the respawn cooldown (``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS``) spaces them.
+_INFRA_LOSS_BLOCK_AFTER = 5
+
+
+def _infra_loss_streak(conn: sqlite3.Connection, task_id: str) -> int:
+    """How many of the card's newest runs, unbroken, are crashed infrastructure losses
+    (capped at ``_INFRA_LOSS_BLOCK_AFTER``): any other run in between ends the streak."""
+    rows = conn.execute(
+        "SELECT outcome, metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT ?",
+        (task_id, _INFRA_LOSS_BLOCK_AFTER),
+    ).fetchall()
+    streak = 0
+    for row in rows:
+        if row["outcome"] != "crashed" or not _kb._json_dict(row["metadata"]).get("infrastructure"):
+            break
+        streak += 1
+    return streak
+
+
 def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]:
     """Count each crash against the breaker; returns the task ids it tripped.
 
@@ -1284,6 +1305,15 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 conn, tid, error=error_text, outcome="crashed", release_claim=False,
                 end_run=False, infrastructure=True,
             )
+            if _infra_loss_streak(conn, tid) >= _INFRA_LOSS_BLOCK_AFTER:
+                # Ordinary block (no ``gave_up``, no breaker count): a card the host keeps
+                # losing before hello waits for an operator instead of cycling forever.
+                if _kb.block_task(
+                    conn, tid, kind="transient",
+                    reason=f"infra: {_INFRA_LOSS_BLOCK_AFTER} perdas antes do hello seguidas "
+                           f"({error_text[:200]})",
+                ):
+                    auto_blocked.append(tid)
             continue
         if dead.protocol_violation:
             streak = _protocol_violation_streak(conn, tid)
