@@ -75,3 +75,74 @@ def test_fence_still_holds_for_everything_else(monkeypatch, fenced_env):
     monkeypatch.delenv(DELEGATED_CHILD_ENV_MARKER)
     with delegated_child_context():
         assert kanban_path_is_fenced(fenced_env) is True
+
+
+def _assert_unfenced(env):
+    assert DELEGATED_CHILD_ENV_MARKER not in env
+    assert "HERMES_KANBAN_TASK" not in env
+    assert "HERMES_KANBAN_DB" not in env
+    assert "HERMES_HOME" in env
+
+
+def test_restart_watcher_env_own_profile_drops_fence(monkeypatch, fenced_env):
+    """host=False, home=None: the watcher hands its own ``dict(os.environ)`` to the respawn."""
+    from hermes_cli.gateway_restart_env import restart_watcher_env
+
+    env = restart_watcher_env(["python", "-m", "hermes_cli.main", "gateway", "run"], host=False, home=None)
+
+    _assert_unfenced(env)
+
+
+def test_restart_watcher_env_host_drops_fence(monkeypatch, tmp_path, fenced_env):
+    """host=True: the scrubbed default-profile env still must not carry the fence."""
+    from hermes_cli.gateway_restart_env import restart_watcher_env
+
+    def fenced_host_env(base=None):
+        return {
+            DELEGATED_CHILD_ENV_MARKER: str(tmp_path),
+            "HERMES_KANBAN_TASK": "t_x",
+            "HERMES_KANBAN_DB": str(fenced_env),
+            "HERMES_HOME": str(tmp_path / "home"),
+        }
+
+    monkeypatch.setattr("tools.environments.local.host_gateway_child_env", fenced_host_env)
+
+    env = restart_watcher_env(["python", "-m", "hermes_cli.main", "gateway", "run"], host=True, home=None)
+
+    _assert_unfenced(env)
+
+
+def test_spawn_unmanaged_gateway_env_drops_fence(monkeypatch, tmp_path, fenced_env):
+    import time
+
+    import hermes_dir_acl
+    from hermes_cli import gateway_runtime_start as grs
+
+    calls = []
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(hermes_dir_acl, "process_is_elevated", lambda: False)
+    monkeypatch.setattr(grs, "start_gateway_job", lambda *a, **kw: None)  # macOS job path
+    monkeypatch.setattr(
+        "hermes_cli.gateway_windows.windowless_gateway_restart_spec",
+        lambda argv, home=None: (argv, str(tmp_path), {"HERMES_TEST_OVERLAY": "1"}),
+    )
+    monkeypatch.setattr(grs.subprocess, "Popen", lambda argv, **kw: calls.append(kw) or SimpleNamespace(pid=4243))
+
+    grs.spawn_unmanaged_gateway(home, deadline=time.monotonic() + 60)
+
+    _assert_unfenced(calls[0]["env"])
+
+
+@pytest.mark.platforms("macos")
+def test_launchd_detached_gateway_env_drops_fence(monkeypatch, tmp_path, fenced_env):
+    from hermes_cli import gateway_launchd
+
+    calls = []
+    monkeypatch.setattr(
+        gateway_launchd.subprocess, "Popen", lambda argv, **kw: calls.append(kw) or SimpleNamespace(pid=1)
+    )
+
+    assert gateway_launchd._spawn_detached_gateway() is True
+
+    _assert_unfenced(calls[0]["env"])
