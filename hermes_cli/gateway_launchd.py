@@ -303,6 +303,8 @@ def _spawn_detached_gateway() -> bool:
         target_home=get_hermes_home(), inherit_credentials=True,
     )
     child_env.pop("_HERMES_GATEWAY", None)
+    from agent.delegation_context import unfence_gateway_child_env
+    unfence_gateway_child_env(child_env)
     try:
         with open(log_dir / "gateway.log", "ab") as out:
             subprocess.Popen(

@@ -4454,12 +4454,23 @@ def _respawn_storm_backoff() -> None:
         logger.debug("respawn-storm breaker check failed (non-fatal): %s", _be)
 
 
+def _drop_inherited_delegate_marker() -> None:
+    """A gateway started from a delegate/worker shell inherits the write fence and would lock its own
+    dispatcher and cron out of the board; it is a service, not that worker's child. Runs before either."""
+    from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER
+    marker = os.environ.pop(DELEGATED_CHILD_ENV_MARKER, None)
+    if marker is not None:
+        logger.warning("gateway booted with inherited %s=%s; dropped it so the dispatcher and cron can use the board",
+                       DELEGATED_CHILD_ENV_MARKER, marker)
+
+
 def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, force: bool = False,
                 idle_exit: bool = False):
     """Run the gateway in foreground. verbose 1=INFO/2+=DEBUG on stderr; quiet: no stderr logs; replace:
     kill an existing instance first (avoids systemd restart loops); force: skip the supervised guard;
     idle_exit: a client auto-started this unsupervised gateway, so it exits once idle
     (``gateway.unmanaged_idle_exit_seconds``)."""
+    _drop_inherited_delegate_marker()
     _guard_official_docker_root_gateway()
     _attach_to_host_gateway_or_guard(force=force, replace=replace)
     _guard_supervised_gateway_conflict(force=force)

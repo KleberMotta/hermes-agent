@@ -95,7 +95,9 @@ def spawn_unmanaged_gateway(profile_home: Path, *, deadline: float, idle_exit: b
     # The target profile's own secrets, never the launching client's: a `hermes -p work` client's
     # dotenv would otherwise become the default daemon's frozen launch env (host_gateway_child_env).
     from tools.environments.local import served_profile_child_env
-    env = served_profile_child_env(base=dict(os.environ), target_home=home, inherit_credentials=True)
+    from agent.delegation_context import unfence_gateway_child_env
+    env = unfence_gateway_child_env(
+        served_profile_child_env(base=dict(os.environ), target_home=home, inherit_credentials=True))
     if sys.platform == "win32":
         from hermes_cli.gateway_windows import windowless_gateway_restart_spec
         command, _, overlay = windowless_gateway_restart_spec(command)
