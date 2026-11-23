@@ -111,9 +111,55 @@ def test_a_run_that_started_resets_the_pre_hello_loss_count(board):
     _complete_run(board)                                                 # the card ran: count restarts
     for k in range(10, 12):
         _lose_once(board, k)
-    assert board.state(CARD)["status"] == "ready"                      
+    assert board.state(CARD)["status"] == "ready"
     _lose_once(board, 12)
     _lose_once(board, 13)
     assert board.state(CARD)["status"] == "ready"                        # 4 since the run
     _lose_once(board, 14)
     assert board.state(CARD)["status"] == "blocked"                      # 5 since the run
+
+
+# --- B5: only a loss the owner recorded as NOT bound is an infrastructure loss ---
+
+_ABSENT = object()
+
+
+def _running_lost(board, tid, *, bound):
+    """A running card whose owner recorded ``worker_lost`` (hello timeout) with ``bound`` as given
+    (``_ABSENT`` leaves the key out of the record)."""
+    run_id = board.running(tid, claim_expires_in=900, heartbeat_age=30)
+    row = board.state(tid)
+    payload = {"reason": HELLO, "claim_lock": row["claim_lock"], "run_id": run_id,
+               "pid": row["worker_pid"]}
+    if bound is not _ABSENT:
+        payload["bound"] = bound
+    board.event(tid, run_id, "worker_lost", payload, row["started_at"] + 24)
+    board.conn.commit()
+    return run_id
+
+
+def test_a_bound_loss_in_a_tick_of_pre_hello_losses_is_charged_not_swallowed(board):
+    pre = ["t_pre0", "t_pre1"]
+    for tid in pre:
+        _running_lost(board, tid, bound=False)
+    bound_run = _running_lost(board, "t_bnd", bound=True)       # same reason, same fingerprint
+    board.tick(failure_limit=2)
+    row = board.state("t_bnd")
+    assert row["status"] == "ready"                              # charged once, below the limit
+    assert row["consecutive_failures"] == 1
+    assert "gave_up" not in _kinds(board, "t_bnd")               # the pre-hello losses do not
+    assert "blocked" not in _kinds(board, "t_bnd")               # make it a systemic failure
+    assert json.loads(board.run(bound_run)["metadata"] or "{}").get("infrastructure") is not True
+    for tid in pre:
+        assert board.state(tid)["consecutive_failures"] == 0
+        assert board.state(tid)["status"] == "ready"
+
+
+def test_a_hello_timeout_loss_not_recorded_as_unbound_charges_the_card(board):
+    runs = {bound: _running_lost(board, f"t_{name}", bound=bound)
+            for name, bound in (("absent", _ABSENT), ("true", True))}
+    board.tick(failure_limit=5)
+    for name, bound in (("absent", _ABSENT), ("true", True)):
+        row, run = board.state(f"t_{name}"), board.run(runs[bound])
+        assert json.loads(run["metadata"] or "{}").get("infrastructure") is not True, name
+        assert row["consecutive_failures"] == 1, name
