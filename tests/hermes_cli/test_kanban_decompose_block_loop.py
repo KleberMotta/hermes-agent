@@ -99,7 +99,10 @@ def test_auto_decompose_tick_never_hands_a_looping_task_to_the_decomposer(kanban
         seen.append(task_id)
         return SimpleNamespace(ok=True, fanout=False, child_ids=None, reason=None)
 
-    monkeypatch.setattr(decomp, "decompose_task", fake_decompose)
+    # Patch by dotted path, not the module object imported at the top: other test
+    # files (test_kanban_cli_dispatch_passthrough.py) purge hermes_cli.* from
+    # sys.modules, and the gateway resolves the module afresh at call time.
+    monkeypatch.setattr("hermes_cli.kanban_decompose.decompose_task", fake_decompose)
     monkeypatch.setattr(kwd, "_board_slugs", lambda kb_: ["default"])
     settings = kwd._DispatcherSettings(60.0, None, None, 2, 0, True, None, None)
     dispatcher = kwd._KanbanDispatcher(SimpleNamespace(DEFAULT_BOARD="default"), settings)
