@@ -1963,6 +1963,72 @@ def configured_max_in_progress() -> Optional[int]:
     return ival if ival >= 1 else None
 
 
+def configured_min_free_ram_mb() -> Optional[int]:
+    """Read ``kanban.min_free_ram_mb``: refuse new spawns while the host has
+    less free RAM than this (MiB). ``None`` when unset/invalid/<= 0 (off).
+
+    Unlike the percentage tiers of ``_memory_pressure_level`` (5% / 15% of
+    MemTotal), this is an absolute floor the operator sizes for their own
+    worker footprint: on a 32 GiB desktop 5% is 1.6 GiB, far too late when
+    each new worker brings 300-600 MiB of node/python children.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        raw = (load_config_readonly() or {}).get("kanban", {}).get("min_free_ram_mb")
+    except Exception:
+        return None
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        ival = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return ival if ival >= 1 else None
+
+
+def _windows_free_ram_mb() -> Optional[int]:
+    """Tighter of available physical memory and remaining commit (MiB) via
+    ``GlobalMemoryStatusEx``; ``None`` on failure. Commit matters on Windows:
+    when it runs out, allocations fail (Resource-Exhaustion-Detector 2004)
+    even with physical pages still available."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _MemStatus(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", wintypes.DWORD), ("dwMemoryLoad", wintypes.DWORD),
+                ("ullTotalPhys", ctypes.c_uint64), ("ullAvailPhys", ctypes.c_uint64),
+                ("ullTotalPageFile", ctypes.c_uint64), ("ullAvailPageFile", ctypes.c_uint64),
+                ("ullTotalVirtual", ctypes.c_uint64), ("ullAvailVirtual", ctypes.c_uint64),
+                ("ullAvailExtendedVirtual", ctypes.c_uint64),
+            ]
+
+        status = _MemStatus()
+        status.dwLength = ctypes.sizeof(_MemStatus)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return None
+        return int(min(status.ullAvailPhys, status.ullAvailPageFile) // (1024 * 1024))
+    except Exception:
+        return None
+
+
+def _free_ram_mb() -> Optional[int]:
+    """Host RAM still free for new workers (MiB), ``None`` when unknown.
+
+    Linux: ``MemAvailable`` from the same sample the pressure guard uses.
+    Windows: :func:`_windows_free_ram_mb` (``sample_memory`` is /proc-only, so
+    the pressure guard is a no-op there today). Elsewhere: unknown → fail open.
+    Module-level seam so tests never read the CI runner's memory.
+    """
+    kib = _system_memory_sample().get("mem_available_kib")
+    if isinstance(kib, int) and not isinstance(kib, bool) and kib >= 0:
+        return kib // 1024
+    if sys.platform == "win32":
+        return _windows_free_ram_mb()
+    return None
+
+
 def count_running_tasks(conn: sqlite3.Connection) -> int:
     """Number of tasks in ``status='running'``.
 
@@ -2297,6 +2363,21 @@ def _tick_spawn_budget(
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
             spawn_budget = remaining
+
+    # Operator floor (kanban.min_free_ram_mb): below it, spawn nothing this
+    # tick. Same deferral semantics as critical pressure; unknown free RAM
+    # imposes no restriction.
+    floor_mb = configured_min_free_ram_mb()
+    if floor_mb is not None:
+        free_mb = _free_ram_mb()
+        if free_mb is not None and free_mb < floor_mb:
+            result.memory_pressure = "critical"
+            _kb._log.warning(
+                "kanban dispatch: %d MiB free RAM is below kanban.min_free_ram_mb=%d; "
+                "spawning no new workers this tick (deferred, not dropped)",
+                free_mb, floor_mb,
+            )
+            return False, None
 
     # Memory-pressure guard: a static cap can't see the host's actual state.
     # critical -> spawn nothing this tick; elevated -> at most one new worker.
