@@ -161,3 +161,81 @@ def test_second_board_gets_a_slot_under_tight_host_cap(kanban_home, monkeypatch,
     assert len(spawned) == 3, spawned
     assert "telas" in boards, f"board 'telas' starved: {spawned}"
     assert ("telas", telas_tid) in spawned
+
+
+# ---------------------------------------------------------------------------
+# The real loop: caps change between ticks without a restart
+# ---------------------------------------------------------------------------
+
+
+def test_watcher_loop_applies_cap_raised_between_ticks(kanban_home, monkeypatch, all_assignees_spawnable):
+    """Boot with ``max_in_progress=2``, config goes to 32 before tick 2: tick 2 dispatches with 32.
+
+    Drives ``GatewayRunner._kanban_dispatcher_watcher`` itself (the incident was the
+    loop never re-reading the cap), with both boards holding ready work: tick 1 fills
+    the 2 host slots from ``default``; tick 2 must run with 32 and give ``telas`` its slots.
+    """
+    import asyncio
+
+    import hermes_cli.config as cfg_mod
+    from gateway.run import GatewayRunner
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    kb.create_board("telas")
+    with kbc.connect() as conn:
+        for i in range(5):
+            kb.create_task(conn, title=f"default-{i}", assignee="alice")
+    with kbc.connect(board="telas") as conn:
+        for i in range(2):
+            kb.create_task(conn, title=f"telas-{i}", assignee="alice")
+
+    live_cfg = {"kanban": {"dispatch_in_gateway": True, "dispatch_interval_seconds": 1,
+                           "auto_decompose": False, "max_in_progress": 2}}
+    monkeypatch.setattr(cfg_mod, "load_config", lambda: live_cfg)
+
+    ticks: list[list[tuple[str, int | None]]] = [[]]
+    spawned: list[tuple[int, str]] = []
+    real_dispatch_once = kbd.dispatch_once
+
+    def recording_dispatch_once(conn, **kw):
+        ticks[-1].append((kw.get("board"), kw.get("max_in_progress")))
+        return real_dispatch_once(conn, **kw)
+
+    def fake_spawn(task, workspace, board=None):
+        spawned.append((len(ticks), board or "default"))
+        return None
+
+    monkeypatch.setattr(kbd, "dispatch_once", recording_dispatch_once)
+    monkeypatch.setattr(kbd, "_default_spawn", fake_spawn)
+    monkeypatch.setattr(kbd, "reap_worker_zombies", lambda: [])
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+
+    async def run_inline(fn, *args, **kwargs):
+        result = fn(*args, **kwargs)
+        if getattr(args[0] if args else None, "__name__", "") == "ready_nonempty":
+            # End of a tick: the RAM guard restores the cap; stop after tick 2.
+            live_cfg["kanban"]["max_in_progress"] = 32
+            if len(ticks) == 2:
+                runner._running = False
+            else:
+                ticks.append([])
+        return result
+
+    async def no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr("gateway.run.asyncio.to_thread", run_inline)
+    monkeypatch.setattr("gateway.run.asyncio.sleep", no_sleep)
+
+    asyncio.run(asyncio.wait_for(runner._kanban_dispatcher_watcher(), timeout=10.0))
+
+    assert len(ticks) == 2, ticks
+    caps = [[cap for _board, cap in tick] for tick in ticks]
+    assert caps == [[2, 2], [32, 32]], ticks
+    tick1 = [b for t, b in spawned if t == 1]
+    tick2 = [b for t, b in spawned if t == 2]
+    assert tick1 == ["default", "default"], spawned
+    assert tick2.count("telas") == 2, f"board 'telas' got no slot after the cap went to 32: {spawned}"
+    assert tick2.count("default") == 3, spawned
