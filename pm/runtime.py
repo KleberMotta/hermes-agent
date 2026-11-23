@@ -98,6 +98,15 @@ def _resident_runtime() -> tuple[Path, Path] | None:
 
 
 def _validate(python: Path, env: dict[str, str]) -> str:
+    """Why the published generation at *python* cannot serve, or ``""`` when nothing proves it broken.
+
+    Only a probe that fails is evidence. One that runs out of time is not: with several Hermes
+    processes booting at once on a loaded Windows host the import takes longer than the timeout,
+    and reading that as "broken" made every such launch re-stage the runtime, answer
+    ``venv_is_current`` False and claim the update lock for a dependency sync, which fenced the
+    gateway (``update_paused``) and dropped every live kanban worker. A generation that is really
+    broken fails its import fast and is still re-staged.
+    """
     try:
         checked = subprocess.run(
             [str(python), "-I", "-B", "-c",
@@ -105,7 +114,9 @@ def _validate(python: Path, env: dict[str, str]) -> str:
             env=env, capture_output=True, text=True, timeout=30,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except subprocess.TimeoutExpired:
+        return ""
+    except OSError as exc:
         return str(exc)
     return checked.stderr.strip() or f"exit {checked.returncode}" if checked.returncode else ""
 

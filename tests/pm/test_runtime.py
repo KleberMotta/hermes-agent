@@ -193,3 +193,46 @@ def test_one_store_through_symlinked_homes_keeps_one_pm_runtime(tmp_path, monkey
     for tools in (home / "tools", task / "tools", real, home / "tools"):
         assert launch(tools) == current
     assert len(staged) == 1
+
+
+@pytest.mark.parametrize("probe, restaged", [
+    ("timeout", False),  # many Hermes processes booting at once: slow is not broken
+    ("import-error", True),  # a really broken generation is still replaced
+])
+def test_published_runtime_is_replaced_only_when_its_probe_fails(tmp_path, monkeypatch, probe, restaged):
+    """A probe that only runs out of time must not re-stage the PM runtime: re-staging made
+    venv_is_current answer False, and each booting worker then claimed the update lock for a
+    dependency sync, fencing the gateway (update_paused) and dropping every live worker."""
+    from pm import runtime
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "pyproject.toml").write_text("[project]\nname = 'fixture'\n")
+    (project / "uv.lock").write_text("version = 1\n")
+    python = tmp_path / "tools" / "python" / "bin" / "python3"
+    python.parent.mkdir(parents=True)
+    python.touch()
+    root = tmp_path / "pm-runtime"
+    published = root / "generations" / "published"
+    published.mkdir(parents=True)
+    (published / "pm-runtime.json").write_text("{}")
+    (root / "selected.json").write_text(json.dumps(
+        {"inputs": runtime._inputs(project, python), "generation": "generations/published"}))
+    staged = []
+
+    def stage(uv, python, environment, **_):
+        staged.append(environment)
+        environment.mkdir(parents=True)
+        return runtime._python(environment)
+
+    def run_probe(command, **kwargs):
+        if probe == "timeout":
+            raise subprocess.TimeoutExpired(command, kwargs.get("timeout"))
+        return subprocess.CompletedProcess(command, 1, "", "ModuleNotFoundError: No module named 'ruamel'")
+
+    monkeypatch.setattr("pm.runtime_stage.stage_runtime", stage)
+    monkeypatch.setattr(runtime.subprocess, "run", run_probe)
+    monkeypatch.setattr(runtime, "_hold_for_children", lambda environment: None)
+    chosen = runtime.prepare_runtime(tmp_path / "tools" / "uv", python, root, project=project, bootstrap=True)
+    assert bool(staged) is restaged
+    assert (chosen != runtime._python(published)) is restaged
