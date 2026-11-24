@@ -657,7 +657,7 @@ def test_block_loop_technical_kind_uses_neutral_orchestration_wording():
     assert "for orchestration attention" in msg
     assert "human decision" not in msg
     # Circuit-breaker visibility is preserved.
-    assert "TRIAGE" in msg
+    assert "LOOP" in msg
     assert "waiting on upstream" in msg
 
 

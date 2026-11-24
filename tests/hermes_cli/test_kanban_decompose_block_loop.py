@@ -64,24 +64,20 @@ def test_include_block_loops_returns_everything(kanban_home):
     assert decomp.list_triage_ids(now=now) == []
 
 
-def test_loop_events_from_real_block_routing_are_counted(kanban_home):
-    """Drive the real block_task router so the event kind stays in sync with the producer."""
+def test_real_block_routing_never_hands_a_loop_to_triage(kanban_home):
+    """Drive the real block_task router: a refusing worker's card loops in ``blocked``
+    (``block_loop_detected``) and never reaches triage, so no sweep can re-specify it."""
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="designer keeps refusing")
         assert kb.get_task(conn, tid).status == "ready"
         loops = 0
         for _ in range(6):
             assert kb.block_task(conn, tid, reason="RECUSADO, nada mudou", kind="needs_input")
-            if kb.get_task(conn, tid).status == "triage":
-                loops += 1
-                ids = decomp.list_triage_ids()
-                assert (tid in ids) == (loops < decomp.BLOCK_LOOP_SKIP_COUNT)
-                # what the auto-decomposer does on a single (no-fanout) spec: back to the pool
-                conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
-                conn.commit()
-            else:
-                assert kb.unblock_task(conn, tid)
-        assert loops >= decomp.BLOCK_LOOP_SKIP_COUNT
+            assert kb.get_task(conn, tid).status == "blocked"
+            assert tid not in decomp.list_triage_ids(include_block_loops=True)
+            loops += kb.list_events(conn, tid)[-1].kind == "block_loop_detected"
+            assert kb.unblock_task(conn, tid)
+        assert loops == 6 - 1  # every re-block after the first is a loop
 
 
 def test_auto_decompose_tick_never_hands_a_looping_task_to_the_decomposer(kanban_home, monkeypatch):

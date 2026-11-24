@@ -448,9 +448,10 @@ def _fmt_changes_requested(ev, n) -> tuple:
 
 
 def _fmt_block_loop_detected(ev, n) -> tuple:
-    """Re-blocked for the same cause past the limit and routed to `triage`.
+    """Re-blocked for the same cause past the limit: the task stays in `blocked`
+    (sticky `block_loop_detected`) until an explicit unblock.
 
-    It emits no blocked/status event, so ping loudly here. A repeated-block
+    It emits no `blocked` event, so ping loudly here. A repeated-block
     circuit breaker establishes that orchestration attention is needed; it
     does NOT establish that a human decision or owner input exists. Use
     neutral orchestration wording unless the block was typed as a genuine

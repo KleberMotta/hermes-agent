@@ -979,6 +979,15 @@ def _commented(conn, reason: Optional[str], author, prefix: str, op):
     return run
 
 
+_BLOCK_OUTCOME_KINDS = ("blocked", "block_loop_detected", "dependency_wait")
+
+
+def _last_block_event_kind(conn, task_id: str) -> Optional[str]:
+    """Kind of the newest block outcome event, so the CLI can tell a loop from a plain block."""
+    kinds = [e.kind for e in kb.list_events(conn, task_id) if e.kind in _BLOCK_OUTCOME_KINDS]
+    return kinds[-1] if kinds else None
+
+
 def _cmd_block(args: argparse.Namespace) -> int:
     reason = _joined_words(args.reason)
     kind = getattr(args, "kind", None)
@@ -987,18 +996,20 @@ def _cmd_block(args: argparse.Namespace) -> int:
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
         def ok_msg(tid):
-            # Report where it landed: dependency blocks -> todo, tripped unblock-loop breaker -> triage.
+            # Report where it landed: dependency blocks -> todo; a tripped unblock-loop breaker stays
+            # in blocked (sticky block_loop_detected) and is announced, since only an unblock frees it.
             landed = kb.get_task(conn, tid)
             where = landed.status if landed else "blocked"
             if where == "todo":
                 return f"{tid} → todo (dependency wait){suffix}"
-            if kind == "dependency" and where == "blocked":
-                return f"Blocked {tid} as needs_input (no open parent to wait on){suffix}"
-            if where == "triage":
+            if where == "blocked" and _last_block_event_kind(conn, tid) == "block_loop_detected":
                 # Only a typed owner-input block carries a question for a human.
                 verdict = ("needs a human decision" if (landed.block_kind if landed else kind) == "needs_input"
                            else "orchestration attention needed")
-                return f"{tid} → triage (unblock loop detected — {verdict}){suffix}"
+                return (f"Blocked {tid}: unblock loop detected ({verdict}); stays in blocked "
+                        f"(block_loop_detected) until an explicit unblock{suffix}")
+            if kind == "dependency" and where == "blocked":
+                return f"Blocked {tid} as needs_input (no open parent to wait on){suffix}"
             return f"Blocked {tid}{suffix}"
 
         op = _commented(conn, reason, author, "BLOCKED", lambda tid: kb.block_task(
