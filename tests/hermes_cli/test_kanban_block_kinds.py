@@ -222,6 +222,28 @@ def test_dependency_block_with_open_parent_stays_parked_across_dispatch_tick(
         assert child in [row[0] for row in res2.spawned]
 
 
+def test_cli_block_announces_the_loop(
+    kanban_home: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`hermes kanban block` names a tripped loop breaker: the task stays in blocked
+    (block_loop_detected) until an explicit unblock. A first block is a plain "Blocked"."""
+    with kbc.connect_closing() as conn:
+        tid = _running_task(conn, title="looping")
+        args = argparse.Namespace(task_id=tid, ids=None, reason=["need", "the", "format"], kind="needs_input")
+        assert kanban_cli._cmd_block(args) == 0
+        first = capsys.readouterr().out
+        assert first.startswith(f"Blocked {tid}: need the format")
+        assert "loop" not in first
+        for _ in range(kb.BLOCK_RECURRENCE_LIMIT - 1):
+            assert kb.unblock_task(conn, tid)
+            assert kb.claim_task(conn, tid, claimer="worker") is not None
+            assert kanban_cli._cmd_block(args) == 0
+        last = capsys.readouterr().out.strip().splitlines()[-1]
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert last.startswith(f"Blocked {tid}: unblock loop detected (needs a human decision)")
+        assert "stays in blocked (block_loop_detected) until an explicit unblock" in last
+
+
 # ---------------------------------------------------------------------------
 # Completion resets loop memory
 # ---------------------------------------------------------------------------
