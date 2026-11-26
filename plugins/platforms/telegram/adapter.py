@@ -220,6 +220,7 @@ from plugins.platforms.telegram.telegram_group_observe import apply_group_observ
 from plugins.platforms.telegram.telegram_picker_labels import model_button_labels
 from plugins.platforms.telegram.telegram_topic_routing import TelegramTopicRoutingMixin
 from plugins.platforms.telegram.telegram_vault_code import TelegramVaultCodeMixin
+from plugins.platforms.telegram.telegram_bootstrap_log import _SUPPRESS_POLLING_BOOTSTRAP_ERROR, _ensure_polling_bootstrap_log_filter
 from utils import env_float, env_int
 
 # Max seconds a send/edit may sleep inline on a flood-control RetryAfter; longer penalties fail
@@ -1635,12 +1636,17 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             if self._teardown_started or generation != self._polling_generation or error_callback is None:
                 return
             callback_context_token = _POLLING_GENERATION_CONTEXT.set(None)
+            callback_bootstrap_token = _SUPPRESS_POLLING_BOOTSTRAP_ERROR.set(None)
             try:
                 error_callback(error)
             finally:
+                _SUPPRESS_POLLING_BOOTSTRAP_ERROR.reset(callback_bootstrap_token)
                 _POLLING_GENERATION_CONTEXT.reset(callback_context_token)
 
+        _ensure_polling_bootstrap_log_filter(TelegramAdapter._looks_like_network_error)
         context_token = _POLLING_GENERATION_CONTEXT.set(generation)
+        bootstrap_log_scope = [True]
+        bootstrap_log_token = _SUPPRESS_POLLING_BOOTSTRAP_ERROR.set(bootstrap_log_scope)
         try:
             # asyncio.wait_for can wait forever on httpcore/AnyIO shielded scopes; use the wall-deadline
             # helper and abandon the partial updater (caller rebuilds).
@@ -1650,6 +1656,8 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                 timeout=_UPDATER_START_TIMEOUT,
                 on_abandon=((lambda app=app: _shutdown_abandoned_app(app)) if abandon_app_on_timeout else None))
         finally:
+            bootstrap_log_scope[0] = False
+            _SUPPRESS_POLLING_BOOTSTRAP_ERROR.reset(bootstrap_log_token)
             _POLLING_GENERATION_CONTEXT.reset(context_token)
         if self._teardown_started:
             self._fence_polling()
