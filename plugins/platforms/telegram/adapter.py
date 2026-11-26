@@ -381,6 +381,55 @@ _TEXT_SEND_DEADLINE = 30.0
 # lock on the wedged socket this bounds). On-disk payloads widen it with size: telegram_media_budget.py.
 _MEDIA_SEND_DEADLINE = 300.0
 _POLLING_GENERATION_CONTEXT: ContextVar[Optional[int]] = ContextVar("telegram_polling_generation", default=None)
+# Holds a 1-element mutable flag [active] while ``_start_polling_once`` is inside ``start_polling()``.
+# Using a mutable cell (flipped to False in ``finally``) guarantees that background tasks spawned via
+# ``asyncio.create_task`` by PTB inside ``start_polling()`` never inherit an active suppression flag
+# after ``_start_polling_once`` returns.
+_SUPPRESS_POLLING_BOOTSTRAP_ERROR: ContextVar[Optional[list[bool]]] = ContextVar(
+    "telegram_suppress_polling_bootstrap_error", default=None
+)
+_BOOTSTRAP_DELETE_WEBHOOK_LOG_PREFIX = "Network Retry Loop (Bootstrap delete Webhook):"
+
+
+class _DowngradePollingBootstrapNetworkError(logging.Filter):
+    """Demote PTB's ``Bootstrap delete Webhook`` ERROR to DEBUG inside ``_start_polling_once``.
+
+    ``Updater.start_polling`` defaults to ``bootstrap_retries=0``, so PTB's ``network_retry_loop``
+    logs ``_LOGGER.exception("... Failed run number 0 of 0. Aborting.")`` on ``telegram.ext`` on
+    the very first transient ``TimedOut``/``NetworkError`` before raising back to
+    ``TelegramAdapter``. The adapter owns the retry/escalation policy (WARNING per transient
+    attempt, ERROR only on cold-start failure or after exhausting the reconnect ladder); keeping
+    PTB's duplicate ERROR floods ``errors.log`` during self-healing network blips. Non-network
+    errors (``InvalidToken``, ``Forbidden``, ``BadRequest``, ``RetryAfter``, ``Conflict``) and
+    calls outside ``_start_polling_once`` (e.g. ``start_webhook``) are left untouched.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        scope = _SUPPRESS_POLLING_BOOTSTRAP_ERROR.get()
+        if not scope or not scope[0]:
+            return True
+        if record.levelno < logging.ERROR:
+            return True
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        if not message.startswith(_BOOTSTRAP_DELETE_WEBHOOK_LOG_PREFIX):
+            return True
+        exc_info = record.exc_info
+        exc = exc_info[1] if isinstance(exc_info, tuple) and len(exc_info) >= 2 else None
+        if not isinstance(exc, Exception) or not TelegramAdapter._looks_like_network_error(exc):
+            return True
+        record.levelno = logging.DEBUG
+        record.levelname = logging.getLevelName(logging.DEBUG)
+        return True
+
+
+def _ensure_polling_bootstrap_log_filter() -> None:
+    """Idempotently attach ``_DowngradePollingBootstrapNetworkError`` to ``telegram.ext``."""
+    ptb_ext_logger = logging.getLogger("telegram.ext")
+    if not any(isinstance(f, _DowngradePollingBootstrapNetworkError) for f in ptb_ext_logger.filters):
+        ptb_ext_logger.addFilter(_DowngradePollingBootstrapNetworkError())
 
 
 class _PollingLifecycleAbort(RuntimeError):
@@ -1635,12 +1684,17 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             if self._teardown_started or generation != self._polling_generation or error_callback is None:
                 return
             callback_context_token = _POLLING_GENERATION_CONTEXT.set(None)
+            callback_bootstrap_token = _SUPPRESS_POLLING_BOOTSTRAP_ERROR.set(None)
             try:
                 error_callback(error)
             finally:
+                _SUPPRESS_POLLING_BOOTSTRAP_ERROR.reset(callback_bootstrap_token)
                 _POLLING_GENERATION_CONTEXT.reset(callback_context_token)
 
+        _ensure_polling_bootstrap_log_filter()
         context_token = _POLLING_GENERATION_CONTEXT.set(generation)
+        bootstrap_log_scope = [True]
+        bootstrap_log_token = _SUPPRESS_POLLING_BOOTSTRAP_ERROR.set(bootstrap_log_scope)
         try:
             # asyncio.wait_for can wait forever on httpcore/AnyIO shielded scopes; use the wall-deadline
             # helper and abandon the partial updater (caller rebuilds).
@@ -1650,6 +1704,8 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                 timeout=_UPDATER_START_TIMEOUT,
                 on_abandon=((lambda app=app: _shutdown_abandoned_app(app)) if abandon_app_on_timeout else None))
         finally:
+            bootstrap_log_scope[0] = False
+            _SUPPRESS_POLLING_BOOTSTRAP_ERROR.reset(bootstrap_log_token)
             _POLLING_GENERATION_CONTEXT.reset(context_token)
         if self._teardown_started:
             self._fence_polling()
