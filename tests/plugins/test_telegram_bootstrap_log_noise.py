@@ -23,6 +23,36 @@ from gateway.config import Platform
 from plugins.platforms.telegram import adapter as tg_adapter
 from plugins.platforms.telegram.adapter import TelegramAdapter
 
+try:
+    from plugins.platforms.telegram import telegram_bootstrap_log as tg_bootstrap_log
+except ImportError:
+    tg_bootstrap_log = None
+
+
+def _remove_bootstrap_log_filters() -> None:
+    if tg_bootstrap_log is None:
+        return
+    ptb_logger = logging.getLogger("telegram.ext")
+    for flt in list(ptb_logger.filters):
+        if isinstance(flt, tg_bootstrap_log._DowngradePollingBootstrapNetworkError):
+            ptb_logger.removeFilter(flt)
+
+
+@pytest.fixture(autouse=True)
+def _clean_bootstrap_log_filter():
+    """Remove ``_DowngradePollingBootstrapNetworkError`` before and after every test so
+    each test proves ``_start_polling_once`` attaches the filter itself."""
+    _remove_bootstrap_log_filters()
+    yield
+    _remove_bootstrap_log_filters()
+
+
+@pytest.fixture(autouse=True)
+def _stub_update_when_ptb_unavailable(monkeypatch):
+    """When python-telegram-bot is absent, ``adapter.Update`` falls back to ``Any`` (no ``ALL_TYPES``)."""
+    if not hasattr(tg_adapter.Update, "ALL_TYPES"):
+        monkeypatch.setattr(tg_adapter, "Update", SimpleNamespace(ALL_TYPES=[]))
+
 
 class _TimedOut(Exception):
     pass
@@ -97,11 +127,40 @@ def _emit_ptb_bootstrap_log(exc: Exception, *, prefix: str = "Network Retry Loop
 
 
 def test_filter_attachment_is_idempotent():
+    assert tg_bootstrap_log is not None
     ptb_logger = logging.getLogger("telegram.ext")
-    tg_adapter._ensure_polling_bootstrap_log_filter()
-    tg_adapter._ensure_polling_bootstrap_log_filter()
-    attached = [f for f in ptb_logger.filters if isinstance(f, tg_adapter._DowngradePollingBootstrapNetworkError)]
+    tg_bootstrap_log._ensure_polling_bootstrap_log_filter(TelegramAdapter._looks_like_network_error)
+    tg_bootstrap_log._ensure_polling_bootstrap_log_filter(TelegramAdapter._looks_like_network_error)
+    attached = [
+        f for f in ptb_logger.filters
+        if isinstance(f, tg_bootstrap_log._DowngradePollingBootstrapNetworkError)
+    ]
     assert len(attached) == 1
+
+
+def test_filter_handles_malformed_log_format_without_raising():
+    assert tg_bootstrap_log is not None
+    flt = tg_bootstrap_log._DowngradePollingBootstrapNetworkError(TelegramAdapter._looks_like_network_error)
+    scope_token = tg_bootstrap_log._SUPPRESS_POLLING_BOOTSTRAP_ERROR.set([True])
+    try:
+        for msg, args in (
+            ("Network Retry Loop (Bootstrap delete Webhook): %d", ("not-an-int",)),
+            ("Network Retry Loop (Bootstrap delete Webhook): %(missing)s", ({"other": 1},)),
+            ("Network Retry Loop (Bootstrap delete Webhook): %z", (1,)),
+        ):
+            record = logging.LogRecord(
+                name="telegram.ext",
+                level=logging.ERROR,
+                pathname=__file__,
+                lineno=1,
+                msg=msg,
+                args=args,
+                exc_info=(_TimedOut, _TimedOut("Timed out"), None),
+            )
+            assert flt.filter(record) is True
+            assert record.levelno == logging.ERROR
+    finally:
+        tg_bootstrap_log._SUPPRESS_POLLING_BOOTSTRAP_ERROR.reset(scope_token)
 
 
 @pytest.mark.asyncio
@@ -127,7 +186,8 @@ async def test_start_polling_once_demotes_transient_bootstrap_network_error(capl
     assert ptb_records[0].levelname == "DEBUG"
     assert not [r for r in ptb_records if r.levelno >= logging.WARNING]
     # ContextVar must be reset after _start_polling_once exits.
-    assert tg_adapter._SUPPRESS_POLLING_BOOTSTRAP_ERROR.get() is None
+    assert tg_bootstrap_log is not None
+    assert tg_bootstrap_log._SUPPRESS_POLLING_BOOTSTRAP_ERROR.get() is None
 
 
 @pytest.mark.asyncio
@@ -162,8 +222,9 @@ async def test_start_polling_once_keeps_non_network_bootstrap_errors_at_error(ca
 
 @pytest.mark.asyncio
 async def test_bootstrap_error_outside_start_polling_once_stays_error(caplog):
-    tg_adapter._ensure_polling_bootstrap_log_filter()
-    assert tg_adapter._SUPPRESS_POLLING_BOOTSTRAP_ERROR.get() is None
+    assert tg_bootstrap_log is not None
+    tg_bootstrap_log._ensure_polling_bootstrap_log_filter(TelegramAdapter._looks_like_network_error)
+    assert tg_bootstrap_log._SUPPRESS_POLLING_BOOTSTRAP_ERROR.get() is None
 
     with caplog.at_level(logging.DEBUG, logger="telegram.ext"):
         _emit_ptb_bootstrap_log(_TimedOut("Timed out"))
@@ -239,6 +300,8 @@ async def test_bootstrap_error_without_exc_info_stays_error(caplog):
 
 @pytest.mark.asyncio
 async def test_generation_error_callback_clears_bootstrap_suppression_context():
+    bootstrap_log = tg_bootstrap_log
+    assert bootstrap_log is not None
     a = _bare_adapter()
     app = MagicMock()
     app.updater = MagicMock()
@@ -247,7 +310,7 @@ async def test_generation_error_callback_clears_bootstrap_suppression_context():
     async def fake_start_polling(**kwargs):
         # PTB spawns its polling task while _start_polling_once holds the context;
         # invoking the wrapped error_callback must NOT inherit suppression.
-        scope = tg_adapter._SUPPRESS_POLLING_BOOTSTRAP_ERROR.get()
+        scope = bootstrap_log._SUPPRESS_POLLING_BOOTSTRAP_ERROR.get()
         assert scope is not None and scope[0] is True
         kwargs["error_callback"](_TimedOut("polling blip"))
 
@@ -256,11 +319,11 @@ async def test_generation_error_callback_clears_bootstrap_suppression_context():
     await a._start_polling_once(
         app,
         drop_pending_updates=False,
-        error_callback=lambda _err: seen_inside_callback.append(tg_adapter._SUPPRESS_POLLING_BOOTSTRAP_ERROR.get()),
+        error_callback=lambda _err: seen_inside_callback.append(bootstrap_log._SUPPRESS_POLLING_BOOTSTRAP_ERROR.get()),
         schedule_verifier=False,
     )
     assert seen_inside_callback == [None]
-    assert tg_adapter._SUPPRESS_POLLING_BOOTSTRAP_ERROR.get() is None
+    assert bootstrap_log._SUPPRESS_POLLING_BOOTSTRAP_ERROR.get() is None
 
 
 @pytest.mark.asyncio
