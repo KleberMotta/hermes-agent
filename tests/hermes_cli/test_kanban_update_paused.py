@@ -30,8 +30,12 @@ from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import update_lock
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
-from tests.hermes_cli.test_kanban_dispatch_silent_reason import kanban_home  # noqa: F401  (fixture)
-from tests.hermes_cli.test_kanban_managed_worker_loss import board  # noqa: F401  (fixture)
+
+# The ``kanban_home`` and ``board`` fixtures.
+pytest_plugins = (
+    "tests.hermes_cli.test_kanban_dispatch_silent_reason",
+    "tests.hermes_cli.test_kanban_managed_worker_loss",
+)
 
 
 @pytest.fixture(autouse=True)

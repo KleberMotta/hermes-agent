@@ -245,6 +245,22 @@ def apply_attempt_note(conn, task_id, pid, dead) -> None:
     dead.error_text = f"{head} [{note}]{sep}{output}"
 
 
+# Owner-recorded ``worker_lost`` reasons that end an attempt before the child received its
+# bootstrap: the card's turn never started, so the loss says nothing about the card.
+_PRE_BOOTSTRAP_LOSS_REASONS = frozenset({"managed_worker_hello_timeout"})
+
+
+def mark_pre_bootstrap_loss(dead) -> None:
+    """Flag a dead worker whose managed child was lost before hello as an infrastructure loss.
+
+    Reads only the owner's structured ``worker_lost`` record (never the worker's own output), so
+    a card cannot talk its way out of the breaker."""
+    lost = dead.event_payload.get("worker_lost") or {}
+    if lost.get("reason") in _PRE_BOOTSTRAP_LOSS_REASONS and lost.get("bound") is False:
+        dead.infrastructure = True
+        dead.event_payload["infrastructure"] = True
+
+
 # What the worker client prints when ensure kept answering the update fence until it gave up
 # (``gateway_client``: ``Gateway {state}: {reason_code}``).
 UPDATE_PAUSED_OUTPUT = "Gateway draining: update_paused"
@@ -263,6 +279,20 @@ def mark_update_paused_loss(conn, task_id, dead) -> None:
         return
     dead.infrastructure = True
     dead.event_payload["infrastructure"] = True
+
+
+def update_holds_spawns(result) -> bool:
+    """True, with the hold named on ``result.spawn_capped``, while the fence the worker's
+    ``ensure`` answers ``update_paused`` from (install-root marker) is up.
+
+    Every worker spawned now would meet ``draining: update_paused`` and die after OWNER_WAIT_S;
+    nothing is claimed, so no card changes and the next tick tries again."""
+    from hermes_cli.gateway_runtime import _update_fenced
+    from hermes_constants import get_default_hermes_root, get_process_hermes_home
+    if not _update_fenced({get_process_hermes_home(), get_default_hermes_root()}):
+        return False
+    result.spawn_capped = {"cap": "update_paused"}
+    return True
 
 
 def owner_reclaim_blocked(conn, task_id, *, crash_sweep=False) -> bool:

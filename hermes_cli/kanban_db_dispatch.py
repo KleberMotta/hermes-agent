@@ -1191,7 +1191,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
         ).fetchall()
         host_prefix = _kb._host_prefix()
         from hermes_cli.kanban_owner_recovery import (
-            apply_attempt_note, managed_run_exit_code, mark_update_paused_loss, owner_reclaim_blocked)
+            apply_attempt_note, managed_run_exit_code, mark_pre_bootstrap_loss, mark_update_paused_loss,
+            owner_reclaim_blocked)
         for row in rows:
             lock = row["claim_lock"] or ""
             if not lock.startswith(host_prefix):
@@ -1213,7 +1214,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             exit_code = managed_run_exit_code(conn, row["id"], pid, row["claim_lock"])
             dead = _classify_dead_worker(pid, row["claim_lock"], exit_code, task_id=row["id"], board=board)
             apply_attempt_note(conn, row["id"], pid, dead)
-            _mark_pre_bootstrap_loss(dead)
+            mark_pre_bootstrap_loss(dead)
             mark_update_paused_loss(conn, row["id"], dead)
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
@@ -1259,22 +1260,6 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
     return sweep
-
-
-# Owner-recorded ``worker_lost`` reasons that end an attempt before the child received its
-# bootstrap: the card's turn never started, so the loss says nothing about the card.
-_PRE_BOOTSTRAP_LOSS_REASONS = frozenset({"managed_worker_hello_timeout"})
-
-
-def _mark_pre_bootstrap_loss(dead: _DeadWorker) -> None:
-    """Flag a dead worker whose managed child was lost before hello as an infrastructure loss.
-
-    Reads only the owner's structured ``worker_lost`` record (never the worker's own output), so
-    a card cannot talk its way out of the breaker."""
-    lost = dead.event_payload.get("worker_lost") or {}
-    if lost.get("reason") in _PRE_BOOTSTRAP_LOSS_REASONS and lost.get("bound") is False:
-        dead.infrastructure = True
-        dead.event_payload["infrastructure"] = True
 
 
 # Consecutive pre-hello infrastructure losses of ONE card after which it is blocked for an
@@ -2313,13 +2298,6 @@ def _run_reclaim_phase(
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 
-def _update_holds_spawns() -> bool:
-    """The fence the worker's ``ensure`` answers ``update_paused`` from (install-root marker)."""
-    from hermes_cli.gateway_runtime import _update_fenced
-    from hermes_constants import get_default_hermes_root, get_process_hermes_home
-    return _update_fenced({get_process_hermes_home(), get_default_hermes_root()})
-
-
 def _tick_spawn_budget(
     conn: sqlite3.Connection,
     result: DispatchResult,
@@ -2336,10 +2314,8 @@ def _tick_spawn_budget(
     every other board count against the same budget, else N boards multiply the
     cap by N — exactly the fan-out the memory-derived default exists to prevent.
     """
-    if _update_holds_spawns():
-        # Every worker would meet ``draining: update_paused`` and die after OWNER_WAIT_S; nothing
-        # is claimed, so no card changes and the next tick tries again.
-        result.spawn_capped = {"cap": "update_paused"}
+    from hermes_cli.kanban_owner_recovery import update_holds_spawns
+    if update_holds_spawns(result):
         return False, None
     # Count already-running tasks so max_spawn enforces concurrency, not a
     # per-tick budget: "running" tasks stay running until the worker makes a terminal
