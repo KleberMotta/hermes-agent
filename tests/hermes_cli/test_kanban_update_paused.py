@@ -23,6 +23,8 @@ import json
 import os
 import time
 
+import pytest
+
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
@@ -30,6 +32,16 @@ from hermes_cli import update_lock
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 from tests.hermes_cli.test_kanban_dispatch_silent_reason import kanban_home  # noqa: F401  (fixture)
 from tests.hermes_cli.test_kanban_managed_worker_loss import board  # noqa: F401  (fixture)
+
+
+@pytest.fixture(autouse=True)
+def _no_parked_worker_handles(monkeypatch):
+    """Start with no parked worker handles: earlier suite tests leave fakes without ``poll()``
+    in ``_live_worker_procs`` and the Windows reaper would trip on them. Both the module this
+    file imported and the one ``sys.modules`` holds now (the passthrough tests re-import it)."""
+    monkeypatch.setattr(kbd, "_live_worker_procs", {})
+    monkeypatch.setattr("hermes_cli.kanban_db_dispatch._live_worker_procs", {})
+
 
 # The worker's own log in the incident (t_87ab7165, run 2798).
 PAUSED_OUTPUT = (
