@@ -245,6 +245,26 @@ def apply_attempt_note(conn, task_id, pid, dead) -> None:
     dead.error_text = f"{head} [{note}]{sep}{output}"
 
 
+# What the worker client prints when ensure kept answering the update fence until it gave up
+# (``gateway_client``: ``Gateway {state}: {reason_code}``).
+UPDATE_PAUSED_OUTPUT = "Gateway draining: update_paused"
+
+
+def mark_update_paused_loss(conn, task_id, dead) -> None:
+    """Book a worker that met the update fence before its owner admitted the run as an
+    infrastructure loss (never charged, the same path as a pre-hello loss).
+
+    Without an ``owner_admitted`` or ``worker_bound`` on the run, the log holds only the
+    client's own words (the card's reply reaches it only after admission), so a card cannot
+    talk its way out of the breaker by printing the phrase."""
+    if UPDATE_PAUSED_OUTPUT not in (dead.event_payload.get("worker_output") or ""):
+        return
+    if _latest_run_event(conn, task_id, "owner_admitted") or _latest_run_event(conn, task_id, "worker_bound"):
+        return
+    dead.infrastructure = True
+    dead.event_payload["infrastructure"] = True
+
+
 def owner_reclaim_blocked(conn, task_id, *, crash_sweep=False) -> bool:
     """True when a reclaim path must leave this task alone.
 
