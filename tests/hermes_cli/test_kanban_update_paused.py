@@ -11,15 +11,24 @@ Gateway draining: update_paused". 22 workers were lost, and a card that never ra
       an infrastructure loss: the card goes back to ``ready``, uncharged, never ``gave_up``;
   U2  the same output AFTER the owner admitted the run is the card's own output and is
       charged as before (a card cannot talk its way out of the breaker);
+  U3  while the update fence is up (the predicate ``ensure`` answers ``update_paused`` from),
+      a dispatcher tick claims and spawns nothing, says so on the result, changes no card,
+      and the first tick after the fence drops spawns the card.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
+import os
+import time
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import update_lock
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+from tests.hermes_cli.test_kanban_dispatch_silent_reason import kanban_home  # noqa: F401  (fixture)
 from tests.hermes_cli.test_kanban_managed_worker_loss import board  # noqa: F401  (fixture)
 
 # The worker's own log in the incident (t_87ab7165, run 2798).
@@ -64,3 +73,51 @@ def test_update_paused_after_the_owner_admitted_the_run_is_charged(board):
     board.tick()
     assert board.state("t_admitted")["consecutive_failures"] == 1       # U2
     assert json.loads(board.run(run_id)["metadata"]).get("infrastructure") is not True
+
+
+# --- U3: the dispatcher does not spawn into a live update ---------------------------------
+
+def _live_update_marker():
+    """A live update claim on the install root, the shape ``hermes update`` publishes."""
+    marker = update_lock.update_marker_path()
+    marker.write_text(f"{os.getpid()}\n{int(time.time())}\nct:{update_lock.process_create_time():.3f}\n",
+                      encoding="utf-8")
+    return marker
+
+
+def test_a_tick_under_a_live_update_spawns_nothing_and_says_why(kanban_home, all_assignees_spawnable):
+    spawns: list = []
+
+    def spawn(task, workspace, board=None):
+        spawns.append(task.id)
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="waits for the update", assignee="alice")
+        marker = _live_update_marker()
+        held = kbd.dispatch_once(conn, spawn_fn=spawn)
+        row = conn.execute("SELECT status, claim_lock, current_run_id FROM tasks WHERE id = ?", (tid,)).fetchone()
+        kinds = [r["kind"] for r in conn.execute("SELECT kind FROM task_events WHERE task_id = ?", (tid,))]
+        assert spawns == [] and held.spawned == []
+        assert (row["status"], row["claim_lock"], row["current_run_id"]) == ("ready", None, None)
+        assert "claimed" not in kinds
+        assert held.spawn_capped == {"cap": "update_paused"}
+        assert "update_paused=1" in kbd.describe_suppression([held])
+
+        marker.unlink()
+        resumed = kbd.dispatch_once(conn, spawn_fn=spawn)
+    assert spawns == [tid]                                               # the next tick spawns it
+    assert resumed.spawn_capped is None
+
+
+def test_cli_dispatch_names_the_update_hold(kanban_home, all_assignees_spawnable, monkeypatch, capsys):
+    from hermes_cli import kanban_ops
+
+    with kbc.connect() as conn:
+        kb.create_task(conn, title="waits for the update", assignee="alice")
+    _live_update_marker()
+    monkeypatch.setattr("hermes_cli.kanban_db_dispatch._default_spawn", lambda *a, **k: None)
+    args = argparse.Namespace(dry_run=False, max=None, json=False, failure_limit=kbd.DEFAULT_FAILURE_LIMIT)
+    assert kanban_ops._cmd_dispatch(args) == 0
+    out = capsys.readouterr().out
+    assert "Spawned:      0" in out
+    assert "Held: an update owns the install (update_paused); no claim attempted" in out

@@ -160,7 +160,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(f"Memory pressure {res.memory_pressure}: new workers restricted this tick")
     capped = res.spawn_capped
     if capped:
-        if capped.get("cap") == "max_spawn":
+        if capped.get("cap") == "update_paused":
+            print("Held: an update owns the install (update_paused); no claim attempted")
+        elif capped.get("cap") == "max_spawn":
             print(f"Capped: --max/kanban.max_spawn={capped.get('limit')} counts this board's running "
                   f"tasks ({capped.get('running')} running); no claim attempted")
         else:

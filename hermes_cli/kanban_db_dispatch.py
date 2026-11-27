@@ -2313,6 +2313,13 @@ def _run_reclaim_phase(
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 
+def _update_holds_spawns() -> bool:
+    """The fence the worker's ``ensure`` answers ``update_paused`` from (install-root marker)."""
+    from hermes_cli.gateway_runtime import _update_fenced
+    from hermes_constants import get_default_hermes_root, get_process_hermes_home
+    return _update_fenced({get_process_hermes_home(), get_default_hermes_root()})
+
+
 def _tick_spawn_budget(
     conn: sqlite3.Connection,
     result: DispatchResult,
@@ -2329,6 +2336,11 @@ def _tick_spawn_budget(
     every other board count against the same budget, else N boards multiply the
     cap by N — exactly the fan-out the memory-derived default exists to prevent.
     """
+    if _update_holds_spawns():
+        # Every worker would meet ``draining: update_paused`` and die after OWNER_WAIT_S; nothing
+        # is claimed, so no card changes and the next tick tries again.
+        result.spawn_capped = {"cap": "update_paused"}
+        return False, None
     # Count already-running tasks so max_spawn enforces concurrency, not a
     # per-tick budget: "running" tasks stay running until the worker makes a terminal
     # board call (kanban_complete/kanban_block/kanban_request_review) or the TTL reclaims them.
